@@ -1,0 +1,197 @@
+const CDP = require('chrome-remote-interface');
+
+// Ring buffer of recent console messages across all attached targets.
+const MAX_LOGS = 5000;
+
+class CdpClient {
+  constructor() {
+    this.port = null;
+    this.targets = new Map(); // targetId -> { client, info, kind }
+    this.logs = [];
+    this.lastError = null;
+    this.refreshTimer = null;
+  }
+
+  async attach(port) {
+    this.port = port;
+    await this.refreshTargets();
+    this.refreshTimer = setInterval(() => this.refreshTargets().catch(() => {}), 2000);
+  }
+
+  async detach() {
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    for (const [, t] of this.targets) {
+      try { await t.client.close(); } catch {}
+    }
+    this.targets.clear();
+  }
+
+  classify(info) {
+    const url = info.url || '';
+    if (/\/__(?:\/|launchpad|cypress)/.test(url)) return 'runner';
+    if (url.startsWith('chrome://') || url.startsWith('devtools://')) return 'system';
+    if (info.type === 'iframe') return 'aut';
+    if (/^https?:\/\//.test(url)) return 'aut';
+    return 'system';
+  }
+
+  async refreshTargets() {
+    if (!this.port) return;
+    let list;
+    try {
+      list = await CDP.List({ port: this.port });
+    } catch (err) {
+      this.lastError = String(err.message || err);
+      return;
+    }
+    const seen = new Set();
+    for (const info of list) {
+      if (info.type !== 'page' && info.type !== 'iframe') continue;
+      const kind = this.classify(info);
+      if (kind === 'system') continue;
+      seen.add(info.id);
+      if (this.targets.has(info.id)) {
+        this.targets.get(info.id).info = info;
+        continue;
+      }
+      await this.attachTarget(info, kind);
+    }
+    for (const id of [...this.targets.keys()]) {
+      if (!seen.has(id)) {
+        try { await this.targets.get(id).client.close(); } catch {}
+        this.targets.delete(id);
+      }
+    }
+  }
+
+  async attachTarget(info, kind) {
+    try {
+      const client = await CDP({ target: info.webSocketDebuggerUrl, local: false });
+      const { Runtime, Log, Page } = client;
+      await Runtime.enable();
+      await Log.enable().catch(() => {});
+      await Page.enable().catch(() => {});
+
+      const record = { client, info, kind };
+      this.targets.set(info.id, record);
+
+      Runtime.consoleAPICalled(({ type, args, timestamp, stackTrace }) => {
+        const text = (args || []).map(argToString).join(' ');
+        this.pushLog({
+          ts: Math.round(timestamp || Date.now()),
+          level: type,
+          text,
+          url: stackTrace?.callFrames?.[0]?.url,
+          kind,
+          targetId: info.id,
+        });
+      });
+      Runtime.exceptionThrown(({ exceptionDetails, timestamp }) => {
+        this.pushLog({
+          ts: Math.round(timestamp || Date.now()),
+          level: 'exception',
+          text: exceptionDetails?.exception?.description || exceptionDetails?.text || 'Uncaught exception',
+          url: exceptionDetails?.url,
+          kind,
+          targetId: info.id,
+        });
+      });
+      Log.entryAdded?.(({ entry }) => {
+        this.pushLog({
+          ts: entry.timestamp || Date.now(),
+          level: entry.level || 'log',
+          text: entry.text,
+          url: entry.url,
+          kind,
+          targetId: info.id,
+        });
+      });
+
+      client.on('disconnect', () => {
+        this.targets.delete(info.id);
+      });
+    } catch (err) {
+      this.lastError = `attach ${info.url}: ${err.message}`;
+    }
+  }
+
+  pushLog(entry) {
+    this.logs.push(entry);
+    if (this.logs.length > MAX_LOGS) this.logs.splice(0, this.logs.length - MAX_LOGS);
+  }
+
+  getLogs({ level, since, kind, limit = 200, grep } = {}) {
+    let out = this.logs;
+    if (level) out = out.filter((l) => l.level === level);
+    if (kind) out = out.filter((l) => l.kind === kind);
+    if (since) out = out.filter((l) => l.ts >= since);
+    if (grep) {
+      const re = new RegExp(grep, 'i');
+      out = out.filter((l) => re.test(l.text));
+    }
+    return out.slice(-limit);
+  }
+
+  // The spec runner page hosts `window.Cypress` AND the AUT iframe. We always
+  // evaluate Cypress-related code on the runner target; for AUT DOM we walk
+  // into `iframe.aut-iframe.contentDocument` from there.
+  pickRunnerTarget() {
+    const all = [...this.targets.values()];
+    const specRunner = all.find((t) => /\/__\/#\/specs/.test(t.info.url || ''));
+    if (specRunner) return specRunner;
+    const anyRunner = all.find((t) => t.kind === 'runner' && t.info.type === 'page');
+    if (anyRunner) return anyRunner;
+    return all.find((t) => t.info.type === 'page') || all[0];
+  }
+
+  async evalOnRunner(expression, { awaitPromise = true, returnByValue = true } = {}) {
+    const target = this.pickRunnerTarget();
+    if (!target) throw new Error('No CDP target available (is `cypress-inspect open` running and a spec selected?)');
+    const { Runtime } = target.client;
+    const res = await Runtime.evaluate({
+      expression,
+      awaitPromise,
+      returnByValue,
+      allowUnsafeEvalBlockedByCSP: true,
+    });
+    if (res.exceptionDetails) {
+      const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text;
+      throw new Error(msg);
+    }
+    return res.result?.value;
+  }
+
+  async screenshot({ kind = 'runner', clip } = {}) {
+    const target = this.pickRunnerTarget();
+    if (!target) throw new Error('No CDP target available');
+    const { Page } = target.client;
+    const opts = { format: 'png' };
+    if (clip) opts.clip = clip;
+    const res = await Page.captureScreenshot(opts);
+    return res.data;
+  }
+
+  listTargets() {
+    return [...this.targets.values()].map((t) => ({
+      id: t.info.id,
+      type: t.info.type,
+      url: t.info.url,
+      title: t.info.title,
+      kind: t.kind,
+      isSpecRunner: /\/__\/#\/specs/.test(t.info.url || ''),
+    }));
+  }
+}
+
+function argToString(arg) {
+  if (arg.value !== undefined) return safeStringify(arg.value);
+  if (arg.unserializableValue) return String(arg.unserializableValue);
+  if (arg.description) return arg.description;
+  return arg.type || '';
+}
+function safeStringify(v) {
+  if (typeof v === 'string') return v;
+  try { return JSON.stringify(v); } catch { return String(v); }
+}
+
+module.exports = { CdpClient };

@@ -1,0 +1,27 @@
+{
+  "name": "cypress-inspect",
+  "version": "0.5.0",
+  "description": "MCP server + CDP attach for debugging Cypress test failures from Claude / VS Code / any MCP-capable agent.",
+  "bin": {
+    "cypress-inspect": "bin/cypress-inspect.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start:mcp": "node bin/cypress-inspect.js mcp",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "chrome-remote-interface": "^0.33.2",
+    "zod": "^3.23.8"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "license": "MIT"
+}
