@@ -23,7 +23,7 @@ async function runMcp() {
     attached = true;
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.5.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.6.0' });
 
   // ───────────────────────────── orientation ─────────────────────────────
 
@@ -72,12 +72,19 @@ async function runMcp() {
     async ({ dedupe } = {}) => {
       await ensureAttached();
       const raw = await cdp.evalOnRunner(probe.FAILURES);
-      // Scan the buffered console for known flake-warning patterns so
-      // get_failures alone can correlate "random dropdown selection" etc.
-      // with a failure, without forcing the agent to make a second
-      // get_console_logs call. Limit to last 1000 entries for cost.
+      // Two signal sources are merged into `flakeSignals`:
+      //   1. CDP console buffer (last 1000)
+      //   2. Reporter command-log rows matching /WARNING:/i — Cypress wraps
+      //      console.* in the AUT iframe and routes calls into the reporter,
+      //      so the buffer often misses them. The reporter scrape is the
+      //      canonical source.
       const logs = cdp.getLogs({ limit: 1000 });
-      const augmented = augmentFailures(raw, { dedupe: !!dedupe, logs });
+      const reporterWarnings = await cdp.evalOnRunner(probe.REPORTER_WARNINGS).catch(() => []);
+      const augmented = augmentFailures(raw, {
+        dedupe: !!dedupe,
+        logs,
+        reporterWarnings,
+      });
       return textResult(JSON.stringify(augmented, null, 2));
     },
   );
@@ -221,7 +228,23 @@ async function runMcp() {
     async (args) => {
       await ensureAttached();
       const logs = cdp.getLogs(args || {});
-      return textResult(logs.map(formatLog).join('\n') || '(no logs)');
+      const status = cdp.bufferStatus();
+      // When empty, ALWAYS return diagnostics so callers can distinguish
+      // "nothing matched" from "capture is broken". When non-empty, still
+      // include a one-line capture summary at the top for the same reason.
+      const header =
+        `# capture: attached ${Math.round((status.capturedSinceMs || 0) / 1000)}s ago, ` +
+        `${status.totalEventsSeen} events seen, ${status.bufferedCount} buffered, ` +
+        `${status.attachedContexts} execution contexts on ${status.attachedTargets} target(s)`;
+      if (logs.length === 0) {
+        return textResult(
+          `${header}\n(no logs matched filter)\n\nDIAGNOSTICS:\n` +
+          JSON.stringify(status, null, 2) +
+          `\n\nIf totalEventsSeen is 0 even after running tests, Cypress likely wrapped console.* before the MCP attached. ` +
+          `Check reporter-DOM warnings via get_failures (which folds them into flakeSignals) or rerun the spec with the MCP already attached.`,
+        );
+      }
+      return textResult(header + '\n' + logs.map(formatLog).join('\n'));
     },
   );
 
@@ -329,8 +352,21 @@ async function runMcp() {
     },
     async () => {
       await ensureAttached();
-      const result = await cdp.evalOnRunner(probe.AUT_INFO);
-      return textResult(JSON.stringify(result, null, 2));
+      const browserSide = await cdp.evalOnRunner(probe.AUT_INFO);
+      const status = cdp.bufferStatus();
+      // Surface the execution contexts the console listener is subscribed to
+      // so callers can tell whether AUT-side console.* calls have a chance of
+      // reaching the buffer.
+      return textResult(JSON.stringify({
+        ...browserSide,
+        capture: {
+          attachedAt: status.attachedAt,
+          attachedTargets: status.attachedTargets,
+          attachedContexts: status.attachedContexts,
+          totalEventsSeen: status.totalEventsSeen,
+          contexts: status.contexts,
+        },
+      }, null, 2));
     },
   );
 

@@ -6,14 +6,17 @@ const MAX_LOGS = 5000;
 class CdpClient {
   constructor() {
     this.port = null;
-    this.targets = new Map(); // targetId -> { client, info, kind }
+    this.targets = new Map(); // targetId -> { client, info, kind, contexts }
     this.logs = [];
     this.lastError = null;
     this.refreshTimer = null;
+    this.attachedAt = null;
+    this.totalLogsSeen = 0;
   }
 
   async attach(port) {
     this.port = port;
+    this.attachedAt = Date.now();
     await this.refreshTargets();
     this.refreshTimer = setInterval(() => this.refreshTargets().catch(() => {}), 2000);
   }
@@ -72,10 +75,27 @@ class CdpClient {
       await Log.enable().catch(() => {});
       await Page.enable().catch(() => {});
 
-      const record = { client, info, kind };
+      const record = { client, info, kind, contexts: new Map() };
       this.targets.set(info.id, record);
 
-      Runtime.consoleAPICalled(({ type, args, timestamp, stackTrace }) => {
+      // Track execution contexts (one per frame). Cypress wraps console.* in
+      // the AUT iframe so Runtime.consoleAPICalled may not fire for that frame
+      // — exposing the context list helps diagnose silent capture.
+      Runtime.executionContextCreated?.(({ context }) => {
+        record.contexts.set(context.id, {
+          id: context.id,
+          origin: context.origin,
+          name: context.name,
+          uniqueId: context.uniqueId,
+          auxData: context.auxData,
+        });
+      });
+      Runtime.executionContextDestroyed?.(({ executionContextId }) => {
+        record.contexts.delete(executionContextId);
+      });
+
+      Runtime.consoleAPICalled(({ type, args, timestamp, stackTrace, executionContextId }) => {
+        this.totalLogsSeen++;
         const text = (args || []).map(argToString).join(' ');
         this.pushLog({
           ts: Math.round(timestamp || Date.now()),
@@ -84,9 +104,11 @@ class CdpClient {
           url: stackTrace?.callFrames?.[0]?.url,
           kind,
           targetId: info.id,
+          executionContextId,
         });
       });
       Runtime.exceptionThrown(({ exceptionDetails, timestamp }) => {
+        this.totalLogsSeen++;
         this.pushLog({
           ts: Math.round(timestamp || Date.now()),
           level: 'exception',
@@ -94,9 +116,11 @@ class CdpClient {
           url: exceptionDetails?.url,
           kind,
           targetId: info.id,
+          executionContextId: exceptionDetails?.executionContextId,
         });
       });
       Log.entryAdded?.(({ entry }) => {
+        this.totalLogsSeen++;
         this.pushLog({
           ts: entry.timestamp || Date.now(),
           level: entry.level || 'log',
@@ -179,7 +203,28 @@ class CdpClient {
       title: t.info.title,
       kind: t.kind,
       isSpecRunner: /\/__\/#\/specs/.test(t.info.url || ''),
+      executionContexts: [...t.contexts.values()],
     }));
+  }
+
+  // Buffer + capture-state diagnostics. Used so callers can distinguish
+  // "no logs matched the filter" from "console capture is broken".
+  bufferStatus() {
+    const contexts = [];
+    for (const t of this.targets.values()) {
+      for (const c of t.contexts.values()) {
+        contexts.push({ targetId: t.info.id, kind: t.kind, ...c });
+      }
+    }
+    return {
+      attachedAt: this.attachedAt,
+      capturedSinceMs: this.attachedAt ? Date.now() - this.attachedAt : null,
+      totalEventsSeen: this.totalLogsSeen,
+      bufferedCount: this.logs.length,
+      attachedTargets: this.targets.size,
+      attachedContexts: contexts.length,
+      contexts,
+    };
   }
 }
 

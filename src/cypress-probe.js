@@ -78,6 +78,18 @@ const FAILURES = `(() => {
       const errEl = el.querySelector('.runnable-err-message, [class*="runnable-err-message"]');
       const stackEl = el.querySelector('.runnable-err-stack-trace, [class*="runnable-err-stack"]');
       const codeFrameEl = el.querySelector('.runnable-err-code-frame, [class*="code-frame"]');
+      // Locate the failed command's DOM index in this test panel.
+      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      let relatedCommandIndex = null;
+      let relatedCommandNumber = null;
+      let relatedCommandText = null;
+      const failedWrapperIdx = wrappers.findIndex((w) => /command-state-failed/.test(w.className || ''));
+      if (failedWrapperIdx >= 0) {
+        relatedCommandIndex = failedWrapperIdx;
+        const numEl = wrappers[failedWrapperIdx].querySelector('.command-number, [class*="command-number"]');
+        if (numEl) relatedCommandNumber = numEl.innerText.trim();
+        relatedCommandText = wrappers[failedWrapperIdx].innerText.trim().slice(0, 240);
+      }
       out.push({
         index: idx,
         suites,
@@ -85,6 +97,9 @@ const FAILURES = `(() => {
         message: errEl ? errEl.innerText.slice(0, 4000) : null,
         stack: stackEl ? stackEl.innerText.slice(0, 4000) : null,
         codeFrame: codeFrameEl ? codeFrameEl.innerText.slice(0, 2000) : null,
+        relatedCommandIndex,
+        relatedCommandNumber,
+        relatedCommandText,
       });
     });
     return { count: out.length, failures: out };
@@ -358,6 +373,35 @@ const PINNED_COMMAND = `(() => {
   };
 })()`;
 
+// Walk every test's command-log entries and return any row whose text matches
+// /WARNING:/i. Cypress wraps console.* in the AUT iframe and routes calls into
+// its reporter, so the CDP console buffer often misses these — the reporter
+// rows are the canonical source. Each result carries enough context (testIndex,
+// command number) for an agent to navigate back to the source.
+const REPORTER_WARNINGS = `(() => {
+  try {
+    const allTests = [...document.querySelectorAll('.test.runnable')];
+    const out = [];
+    allTests.forEach((testEl, testIndex) => {
+      const titleEl = testEl.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
+      const testTitle = titleEl ? titleEl.innerText.split('\\n')[0].trim() : null;
+      const wrappers = testEl.querySelectorAll('.command-wrapper, [class*="command-wrapper"]');
+      wrappers.forEach((w) => {
+        const text = (w.innerText || '').trim();
+        if (!/WARNING:/i.test(text)) return;
+        const numEl = w.querySelector('.command-number, [class*="command-number"]');
+        out.push({
+          testIndex,
+          testTitle,
+          commandNumber: numEl ? numEl.innerText.trim() : null,
+          text: text.slice(0, 500),
+        });
+      });
+    });
+    return out;
+  } catch (e) { return []; }
+})()`;
+
 // Bounding box of the AUT iframe (for screenshot clipping).
 const AUT_RECT = `(() => {
   const aut = document.querySelector('iframe.aut-iframe');
@@ -374,6 +418,7 @@ module.exports = {
   AUT_RECT,
   AUT_INFO,
   PINNED_COMMAND,
+  REPORTER_WARNINGS,
   commandsForTestExpr,
   stepToExpr,
   autDomExpr,

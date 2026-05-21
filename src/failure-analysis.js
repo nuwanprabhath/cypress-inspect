@@ -90,7 +90,7 @@ const FLAKE_PATTERNS = [
   },
 ];
 
-function scanFlakeSignals(logs) {
+function scanFlakeSignals(logs, { source = 'console' } = {}) {
   if (!Array.isArray(logs) || logs.length === 0) return [];
   const out = [];
   for (const { id, pattern, explain } of FLAKE_PATTERNS) {
@@ -99,18 +99,36 @@ function scanFlakeSignals(logs) {
       out.push({
         id,
         explain,
+        source,
         count: hits.length,
         firstOccurrence: hits[0],
-        sample: hits[0].text.slice(0, 240),
+        sample: (hits[0].text || '').slice(0, 240),
       });
     }
   }
   return out;
 }
 
+function mergeFlakeSignals(...lists) {
+  const byId = new Map();
+  for (const list of lists) {
+    for (const sig of list) {
+      const existing = byId.get(sig.id);
+      if (!existing) {
+        byId.set(sig.id, { ...sig, sources: [sig.source].filter(Boolean) });
+      } else {
+        existing.count += sig.count;
+        if (sig.source && !existing.sources.includes(sig.source)) existing.sources.push(sig.source);
+      }
+    }
+  }
+  // Drop the per-entry `source` since we have `sources` aggregated.
+  return [...byId.values()].map((s) => { const { source, ...rest } = s; return rest; });
+}
+
 // Augment a get_failures payload with parsed diffs, cascade annotations, and
 // optional flake signals scanned from a console log buffer (pass `logs`).
-function augmentFailures(payload, { dedupe = false, logs = null } = {}) {
+function augmentFailures(payload, { dedupe = false, logs = null, reporterWarnings = null } = {}) {
   if (!payload || !Array.isArray(payload.failures)) return payload;
   let failures = payload.failures.map((f) => {
     const parsed = parseCompareError(f.message);
@@ -118,7 +136,11 @@ function augmentFailures(payload, { dedupe = false, logs = null } = {}) {
   });
   failures = annotateCascades(failures);
 
-  const flakeSignals = logs ? scanFlakeSignals(logs) : [];
+  const consoleSignals = logs ? scanFlakeSignals(logs, { source: 'console' }) : [];
+  const reporterSignals = reporterWarnings
+    ? scanFlakeSignals(reporterWarnings, { source: 'reporter' })
+    : [];
+  const flakeSignals = mergeFlakeSignals(consoleSignals, reporterSignals);
   // Attach the flake signals as a hint on the root-cause failure, since they
   // typically explain the root, not the cascades.
   if (flakeSignals.length) {
@@ -150,4 +172,11 @@ function augmentFailures(payload, { dedupe = false, logs = null } = {}) {
   return { ...payload, failures, flakeSignals };
 }
 
-module.exports = { parseCompareError, annotateCascades, augmentFailures, scanFlakeSignals, FLAKE_PATTERNS };
+module.exports = {
+  parseCompareError,
+  annotateCascades,
+  augmentFailures,
+  scanFlakeSignals,
+  mergeFlakeSignals,
+  FLAKE_PATTERNS,
+};

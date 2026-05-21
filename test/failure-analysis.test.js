@@ -165,6 +165,37 @@ test('augmentFailures: attaches flakeSignals to root failure', () => {
   assert.equal(out.flakeSignals.length, 1);
 });
 
+test('augmentFailures: reporterWarnings is a flake-signal source (Cypress wraps console.*)', () => {
+  // The CDP console buffer is empty, but the reporter captured the warning.
+  // The merged flakeSignals should still detect random_dropdown_selection.
+  const out = augmentFailures(
+    { failures: [{ index: 9, title: 'r', message: 'something' }] },
+    {
+      logs: [],
+      reporterWarnings: [
+        { text: 'WARNING: selecting random item from dropdown - flake risk', testIndex: 9, commandNumber: '111' },
+      ],
+    },
+  );
+  assert.equal(out.flakeSignals.length, 1);
+  assert.equal(out.flakeSignals[0].id, 'random_dropdown_selection');
+  assert.deepEqual(out.flakeSignals[0].sources, ['reporter']);
+  assert.deepEqual(out.failures[0].flakeSignals, ['random_dropdown_selection']);
+});
+
+test('augmentFailures: console + reporter signals merge by id with both sources listed', () => {
+  const out = augmentFailures(
+    { failures: [{ index: 9, message: 'x' }] },
+    {
+      logs: [{ text: 'WARNING: selecting random item from dropdown' }],
+      reporterWarnings: [{ text: 'WARNING: selecting random item from dropdown' }],
+    },
+  );
+  assert.equal(out.flakeSignals.length, 1);
+  assert.equal(out.flakeSignals[0].count, 2);
+  assert.deepEqual(out.flakeSignals[0].sources.sort(), ['console', 'reporter']);
+});
+
 test('augmentFailures dedupe: surfaces rootCauses[] and flakeSignals top-level', () => {
   const out = augmentFailures(
     {

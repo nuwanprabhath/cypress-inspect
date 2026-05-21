@@ -22,7 +22,9 @@ cd ~/projects/pet-projects/cypress-inspect
 npm install
 ```
 
-Register with Claude Code globally (works across all worktrees):
+### Claude Code
+
+Register globally (works across all worktrees and projects):
 
 ```bash
 claude mcp add --scope user cypress-inspect \
@@ -30,6 +32,46 @@ claude mcp add --scope user cypress-inspect \
 ```
 
 Verify with `claude mcp list` and `/mcp` inside a Claude session.
+
+### VS Code Copilot (GitHub Copilot Chat)
+
+VS Code reads MCP server definitions from a `.vscode/mcp.json` file at the workspace root, or from your user settings. Choose the scope that fits.
+
+**Workspace-level** (committed to the repo — good for teams):
+
+Create `.vscode/mcp.json` in your webapp project:
+
+```json
+{
+  "servers": {
+    "cypress-inspect": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/cypress-inspect/bin/cypress-inspect.js", "mcp"]
+    }
+  }
+}
+```
+
+**User-level** (applies to every workspace you open):
+
+Open VS Code settings (`Cmd+,`), switch to JSON (`Open User Settings (JSON)`), and add:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "cypress-inspect": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["/absolute/path/to/cypress-inspect/bin/cypress-inspect.js", "mcp"]
+      }
+    }
+  }
+}
+```
+
+After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the agent), and the `cypress-inspect` tools will appear in the tool picker. You can also reference them explicitly: `Use cypress-inspect get_overview to show me the failing tests.`
 
 ## Use
 
@@ -51,14 +93,14 @@ Verify with `claude mcp list` and `/mcp` inside a Claude session.
 
    > "A Cypress test failed. Use cypress-inspect to debug it. Start with `get_overview`, then `get_failures` for the full list, then `step_to` and `get_dom` to inspect the state at the failing command."
 
-## Tools (v0.5)
+## Tools (v0.6)
 
 ### Orientation
 | Tool | Use |
 | --- | --- |
 | `status` | Session info + attached CDP targets. Always call if something returns "no Cypress". |
 | `get_overview` | **Start here.** Spec file, pass/fail/pending counts, first failure (title + suite + error + stack + code frame), live test if any. |
-| `get_failures` `{ dedupe? }` | All failed tests with error/stack/code-frame. Auto-tags `rootCause: true` on the first failure + `looksLikeCascade` / `cascadeOf` on downstream ones. Compare-style errors are parsed into `parsedDiff.diffs: [{ path, pathSegments, expected, actual }]`. Includes top-level `flakeSignals` populated by scanning the console buffer for known flake warnings (e.g. `random_dropdown_selection`); matching IDs also attach to the root failure. `dedupe: true` adds `rootCauses: [<index>]` and splits cascading failures into a separate array. |
+| `get_failures` `{ dedupe? }` | All failed tests with error/stack/code-frame. Auto-tags `rootCause: true` on the first failure + `looksLikeCascade` / `cascadeOf` on downstream ones. Each failure also includes `relatedCommandIndex` / `relatedCommandNumber` pointing at the failed command in the reporter so the agent can `step_to` directly. Compare-style errors are parsed into `parsedDiff.diffs: [{ path, pathSegments, expected, actual }]`. Top-level `flakeSignals` is populated from TWO sources merged by id: the CDP console buffer **and** the reporter command-log (`/WARNING:/i` rows) — important because Cypress wraps `console.*` in the AUT iframe so the CDP buffer often misses warnings. Matching IDs also attach to the root failure. `dedupe: true` adds `rootCauses: [<index>]` and splits cascading failures into a separate array. |
 | `parse_compare_error` `{ message }` | Standalone parser for "Compare - FAILURES" / "InProgress Summary Widget comparison failed" strings. Returns `{ summary: { failed, total }, diffs: [...] }`. |
 | `list_tests` | Lightweight list of every test with state + title + suite ancestry. Use returned `index` with the next two tools. |
 | `find_test` `{ query }` | Partial-title search across tests. Returns matches with index + state. Faster than scanning `list_tests`. |
@@ -75,12 +117,12 @@ Verify with `claude mcp list` and `/mcp` inside a Claude session.
 ### Console / visual / DOM
 | Tool | Use |
 | --- | --- |
-| `get_console_logs` `{ level?, grep?, since?, limit? }` | Buffered console events since the MCP server attached. |
+| `get_console_logs` `{ level?, grep?, since?, limit? }` | Buffered console events since the MCP server attached. Response always includes a capture-status header (`attached Xs ago, N events seen, M buffered, K contexts on T target(s)`); when the buffer is empty, full diagnostics are returned so callers can distinguish "nothing matched the filter" from "capture is broken". |
 | `screenshot` `{ kind?: 'full' \| 'aut' }` | PNG of the whole runner viewport, or just the AUT iframe. |
 | `list_saved_screenshots` / `read_saved_screenshot` | Cypress's `cypress/screenshots/` artifacts (relevant for `cypress run` mode). |
 | `get_dom` `{ selector?, maxBytes? }` | Rendered HTML of the AUT iframe at the currently-pinned snapshot. |
 | `find_in_aut` `{ selector, limit?, textOnly? }` | Run a CSS selector against the AUT. Default: compact JSON per match (tag, attrs, text, textTruncated, textLength, value, visible, disabled). `textOnly: true` returns just the **full untruncated text** of each match — best for summary widgets or anything where you only care what the user reads. |
-| `get_aut_info` | AUT iframe src + location (href/pathname/hash/search) + document.title + readyState + navigator.onLine. Confirms the app is where you expect. |
+| `get_aut_info` | AUT iframe src + location (href/pathname/hash/search) + document.title + readyState + navigator.onLine. Also returns a `capture` block with attached targets, execution contexts (with origin / aux frame data), and total events seen — useful for diagnosing why a console.* call might not be reaching the buffer. |
 
 ### Escape hatch
 | Tool | Use |
