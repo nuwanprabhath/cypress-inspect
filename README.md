@@ -178,7 +178,7 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 
    > "A Cypress test failed. Use cypress-inspect to debug it. Start with `get_overview`, then `get_failures` for the full list, then `step_to` and `get_dom` to inspect the state at the failing command."
 
-## Tools (v0.8)
+## Tools (v0.8.1)
 
 ### Orientation
 | Tool | Use |
@@ -186,7 +186,7 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 | `status` | Session info + attached CDP targets. Always call if something returns "no Cypress". |
 | `get_overview` | **Start here.** Spec file, pass/fail/pending counts, first failure (title + suite + error + stack + code frame), live test if any. |
 | `get_failures` `{ dedupe? }` | All failed tests with error/stack/code-frame. Auto-tags `rootCause: true` on the first failure + `looksLikeCascade` / `cascadeOf` on downstream ones. Each failure also includes:<br>• `relatedCommandIndex` / `relatedCommandNumber` pointing at the failed command in the reporter so the agent can `step_to` directly<br>• `cypressDocsHints: [{ command, url }]` linking every `cy.<command>` mentioned in the error to its docs page<br>• `classification: { category, confidence, explain, evidence }` — stable named cause (`compare_diff`, `dropdown_ambiguity`, `selector_not_found`, `route_mismatch`, `network_failure`, `timeout_cascade`, `stale_local_state`, `unknown`)<br>Compare-style errors are parsed into `parsedDiff.diffs: [{ path, pathSegments, expected, actual }]`. Top-level `flakeSignals` is populated from TWO sources merged by id: the CDP console buffer **and** the reporter command-log (`/WARNING:/i` rows) — important because Cypress wraps `console.*` in the AUT iframe so the CDP buffer often misses warnings. Matching IDs also attach to the root failure. `dedupe: true` adds `rootCauses: [<index>]` and splits cascading failures into a separate array. |
-| `get_failure_context` `{ failureIndex \| testIndex, commandIndex?, before?, after? }` | The N commands before and M after the failing command (defaults 5/5). Skips the manual slice agents usually have to do after `get_failures`. |
+| `get_failure_context` `{ failureIndex \| testIndex, commandIndex?, before?, after?, mode? }` | The N commands before and M after the failing command (defaults 5/5). `mode: "logical"` (default) counts UNIQUE displayed command numbers — what a human sees in the reporter. `mode: "wrappers"` counts raw DOM rows (Cypress emits 2-3 wrappers per command, so 5/5 can balloon). Skips the manual slice after `get_failures`. |
 | `parse_compare_error` `{ message }` | Standalone parser for "Compare - FAILURES" / "InProgress Summary Widget comparison failed" strings. Returns `{ summary: { failed, total }, diffs: [...] }`. |
 | `list_tests` | Lightweight list of every test with state + title + suite ancestry. Use returned `index` with the next two tools. |
 | `find_test` `{ query }` | Partial-title search across tests. Returns matches with index + state. Faster than scanning `list_tests`. |
@@ -195,7 +195,7 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 | Tool | Use |
 | --- | --- |
 | `get_test_commands` `{ index, full? }` | Commands rendered for the test at that reporter index. Each entry has `number` (display, may repeat across rows), `index` (unique DOM position), plus `argTruncated`/`argLength` markers. `full: true` returns untruncated args + text. Response also includes `numberToIndex` to resolve a displayed reporter number to a DOM index. |
-| `get_test_commands_summary` `{ index }` | Triage view: one row per UNIQUE displayed command number (`name`, short `arg`, `state`). Designed for complex tests where the full command list busts the token budget. Also surfaces `firstFailedNumber` for fast `step_to`. |
+| `get_test_commands_summary` `{ index? \| forFirstFailure? }` | Triage view: one row per UNIQUE displayed command number (`name`, short `arg`, `state`). Designed for complex tests where the full command list busts the token budget. `forFirstFailure: true` resolves the test for you (skips a `list_tests` round-trip). Also surfaces `firstFailedNumber` for fast `step_to`. Emits a `_warning` when the result is empty (typically a GC'd post-run panel). |
 | `get_test_commands_page` `{ index, page?, pageSize?, full? }` | Paged variant of `get_test_commands` — returns one slice at a time with `start/end/total/hasMore`. Use when `get_test_commands` would truncate. |
 | `get_live_commands` | `Cypress.cy.queue` for the in-flight test only. |
 | `step_to` `{ testIndex, commandIndex \| commandNumber }` | Time-travel: pin the AUT snapshot to that command. Prefer `commandNumber` (the visible reporter number) — it's what humans see. Falls back to `commandIndex` (raw DOM position) when you need to disambiguate duplicated rows. Expands the panel if collapsed. |
@@ -216,14 +216,16 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 ### Network
 | Tool | Use |
 | --- | --- |
-| `get_network_logs` `{ grep?, since?, statusMin?, statusMax?, failedOnly?, limit? }` | CDP-buffered HTTP requests. Filter by URL regex, status range, or `failedOnly: true` (failed OR ≥400). Each row: method / url / status / mime / durationMs / failed / failureText. Bodies are NOT captured — use `eval` if needed. |
+| `get_network_logs` `{ grep?, since?, statusMin?, statusMax?, failedOnly?, limit? }` | CDP-buffered HTTP requests. Filter by URL regex, status range, or `failedOnly: true` (failed OR ≥400). Each row: method / url / status / mime / durationMs / failed / failureText. Bodies are NOT captured — use `eval` if needed. Empty response distinguishes "filter excluded everything" from "buffer empty since attach"; the latter is the usual surprise. |
 
 ### App state / control
 | Tool | Use |
 | --- | --- |
-| `get_storage` | Snapshot of localStorage, sessionStorage, cookies, and IndexedDB database names from the AUT iframe. Each value clipped to 1 KB. Use to diagnose stale-state flakes (cached auth, partially-synced PouchDB databases). |
+| `get_storage` | Snapshot of localStorage, sessionStorage, cookies, and IndexedDB database **names** from the AUT iframe. Each value clipped to 1 KB. Use to diagnose stale-state flakes (cached auth, partially-synced PouchDB databases). For object-store contents see `get_indexeddb`. |
+| `get_indexeddb` `{ dbName, store?, limit?, valueMaxBytes? }` | Open an IndexedDB database and either list its object stores (omit `store`) or dump records from one store (default 25, max 500). Values are JSON-stringified and clipped to `valueMaxBytes` (default 2 KB). Designed for PouchDB / offline-queue debugging without writing eval payloads. |
 | `clear_app_state` | **Write operation.** Clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database in the AUT. Returns counts of what was cleared. |
-| `rerun_spec` | Re-run the current spec from the top. Tries `Cypress.emit("restart")`, falls back to `location.reload()`. (Cypress does not expose "rerun failed only".) Pair with `clear_app_state` for a clean-slate re-run. |
+| `rerun_spec` `{ await?, timeoutMs? }` | Re-run the current spec from the top. Tries `Cypress.emit("restart")`, falls back to `location.reload()`. Returns `{ triggered: true, hint, previousCounts }`; `await: true` blocks until the runner actually starts (or `timedOut`). |
+| `reset_and_rerun` `{ timeoutMs? }` | One-shot: `clear_app_state` followed by `rerun_spec { await: true }`. Returns both reports so the agent can confirm what was cleared and that the rerun started. |
 | `wait_for_failure` `{ baseline?, timeoutMs?, pollMs? }` | Block until the failure count grows past `baseline` (or current count) and return the new failure. Lets a watch-mode agent react to the next failure without the user nudging it. Timeout default 60 s, max 120 s. |
 
 ### Docs & static analysis
@@ -256,6 +258,8 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 - **`cypress open` with Chrome only**. Electron mode's CDP port isn't announced the same way. Pass `--browser chrome` (the wrapper adds it automatically).
 - **Port-scrape fragility**: detection relies on Cypress's `cypress:server:browsers*` debug strings. If those change, you'll see no `[cypress-inspect] Detected CDP port:` line.
 - **Console buffer is in-memory, capped at 5,000 entries**. Logs from before the MCP server attached are not captured. Best practice: start the MCP server, then run the failing spec.
+- **Network buffer is in-memory, capped at 2,000 entries**. Same "since attach" caveat — `get_network_logs` will warn when the buffer is empty so the agent doesn't blame its filter.
+- **Cypress garbage-collects test panels after a spec completes.** `get_test_commands*` returns empty for finished specs; trigger `rerun_spec` (or `reset_and_rerun`) to repopulate.
 - **No write tools.** The plugin is read-only by design — it scrapes/clicks the runner UI, never modifies your project files or Cypress config.
 
 ## Inspirations

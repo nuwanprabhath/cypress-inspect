@@ -137,7 +137,7 @@ async function runMcp() {
     'get_test_commands',
     {
       title: 'Get commands logged for a specific test',
-      description: 'Returns the rendered command list for the test at `index` (use `list_tests` to find it). Each entry has `number` (reporter-displayed number, NOT unique across rows — Cypress renders one logical command as 2-3 wrapper rows for parent+children), `index` (raw DOM position, unique), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength` so you can tell when content was cut. Set `full: true` to return untruncated args + text (heavier payload — use when the error message is buried in a log row\'s arg). The result also includes `numberToIndex` mapping for quickly resolving a displayed reporter number to the first DOM index, useful with `step_to { commandNumber }`.',
+      description: 'Returns the rendered command list for the test at `index` (use `list_tests` to find it). Each entry has `number` (reporter-displayed number, NOT unique across rows — Cypress renders one logical command as 2-3 wrapper rows for parent+children), `index` (raw DOM position, unique), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength` so you can tell when content was cut. Set `full: true` to return untruncated args + text (heavier payload — use when the error message is buried in a log row\'s arg). The result also includes `numberToIndex` mapping for quickly resolving a displayed reporter number to the first DOM index, useful with `step_to { commandNumber }`.\n\nFinished-spec caveat: Cypress garbage-collects test panels after a spec completes, so an empty `commands: []` typically means the spec is no longer live. Call mid-run, or trigger `rerun_spec` first. (For complex specs prefer `get_test_commands_summary` / `get_test_commands_page` to avoid truncation.)',
       inputSchema: {
         index: z.number().int().nonnegative(),
         full: z.boolean().optional(),
@@ -168,12 +168,28 @@ async function runMcp() {
     'get_test_commands_summary',
     {
       title: 'Lightweight command summary (triage view)',
-      description: 'Returns one row per UNIQUE displayed command number — name, arg (≤80 chars), state. Cypress renders one logical command as 2-3 wrapper rows; this view collapses them. Designed for triage on complex tests where `get_test_commands` busts the token budget. Also returns `firstFailedNumber` for fast jumps via `step_to`.',
-      inputSchema: { index: z.number().int().nonnegative() },
+      description: 'Returns one row per UNIQUE displayed command number — name, arg (≤80 chars), state. Cypress renders one logical command as 2-3 wrapper rows; this view collapses them. Designed for triage on complex tests where `get_test_commands` busts the token budget. Also returns `firstFailedNumber` for fast jumps via `step_to`.\n\nPass EITHER `index` (a specific test) OR `forFirstFailure: true` (skip the `find_test`/`list_tests` step — uses the first failed test in the spec).\n\nFinished-spec caveat: Cypress garbage-collects test panels after a spec completes, so `commandCount: 0` typically means the spec is no longer live. Call mid-run, or run `rerun_spec` first.',
+      inputSchema: {
+        index: z.number().int().nonnegative().optional(),
+        forFirstFailure: z.boolean().optional(),
+      },
     },
-    async ({ index }) => {
+    async ({ index, forFirstFailure } = {}) => {
       await ensureAttached();
-      const result = await cdp.evalOnRunner(probe.commandsSummaryForTestExpr(index));
+      let resolvedIndex = index;
+      if (resolvedIndex == null) {
+        if (!forFirstFailure) return textResult('Pass either `index` or `forFirstFailure: true`.');
+        const overview = await cdp.evalOnRunner(probe.OVERVIEW);
+        const tests = overview?.counts?.total ? await cdp.evalOnRunner(probe.LIST_TESTS) : [];
+        const firstFailed = (tests || []).find((t) => t.state === 'failed');
+        if (!firstFailed) return textResult('No failed tests in the spec.');
+        resolvedIndex = firstFailed.index;
+      }
+      const result = await cdp.evalOnRunner(probe.commandsSummaryForTestExpr(resolvedIndex));
+      if (result && result.commandCount === 0 && !result.error) {
+        result._warning = 'commandCount is 0 — Cypress may have garbage-collected the panel (typical after spec completion). Call mid-run or trigger `rerun_spec` first.';
+      }
+      if (result && resolvedIndex !== index) result._resolvedFrom = 'forFirstFailure';
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -182,7 +198,7 @@ async function runMcp() {
     'get_test_commands_page',
     {
       title: 'Paged command log (for huge tests)',
-      description: 'Same shape as `get_test_commands` but returns one page of wrappers (default 50). Pass `{ index, page, pageSize?, full? }`. Response includes `start/end/total/hasMore` so the caller can iterate. Use when `get_test_commands` truncation breaks your debugging flow.',
+      description: 'Same shape as `get_test_commands` but returns one page of wrappers (default 50). Pass `{ index, page, pageSize?, full? }`. Response includes `start/end/total/hasMore` so the caller can iterate. Use when `get_test_commands` truncation breaks your debugging flow.\n\nFinished-spec caveat: same as `get_test_commands` — Cypress GCs test panels after spec completion. If `total: 0`, trigger `rerun_spec` first.',
       inputSchema: {
         index: z.number().int().nonnegative(),
         page: z.number().int().nonnegative().optional(),
@@ -201,16 +217,17 @@ async function runMcp() {
     'get_failure_context',
     {
       title: 'Commands before / after the failing command',
-      description: 'Returns the N commands BEFORE and M AFTER the failing command in a given failed test (default 5 / 5). Resolves the anchor from either `failureIndex` (a test\'s reporter index — finds the failed command in it) or an explicit `{ testIndex, commandIndex }`. The most common follow-up to `get_failures` — skips manual slicing.',
+      description: 'Returns the N commands BEFORE and M AFTER the failing command in a given failed test (default 5 / 5). Resolves the anchor from either `failureIndex` (a test\'s reporter index — finds the failed command in it) or an explicit `{ testIndex, commandIndex }`. The most common follow-up to `get_failures` — skips manual slicing.\n\n`mode` controls what `before`/`after` count:\n  • `"logical"` (default) — UNIQUE displayed command numbers. 5/5 ≈ 5 logical cy.* calls on each side. Matches what a human sees in the reporter.\n  • `"wrappers"` — raw DOM rows. Cypress emits 2-3 wrappers per command (parent + retries), so 5/5 can return up to ~33 rows. Use only if you need exact wrapper-row diagnostics.',
       inputSchema: {
         failureIndex: z.number().int().nonnegative().optional(),
         testIndex: z.number().int().nonnegative().optional(),
         commandIndex: z.number().int().nonnegative().optional(),
         before: z.number().int().nonnegative().max(50).optional(),
         after: z.number().int().nonnegative().max(50).optional(),
+        mode: z.enum(['logical', 'wrappers']).optional(),
       },
     },
-    async ({ failureIndex, testIndex, commandIndex, before = 5, after = 5 }) => {
+    async ({ failureIndex, testIndex, commandIndex, before = 5, after = 5, mode = 'logical' }) => {
       await ensureAttached();
       let tIdx = testIndex;
       let anchor = commandIndex;
@@ -223,7 +240,7 @@ async function runMcp() {
         anchor = f.relatedCommandIndex;
         if (anchor == null) return textResult(`No failed command found in test ${tIdx}.`);
       }
-      const result = await cdp.evalOnRunner(probe.commandsAroundExpr(tIdx, anchor, before, after));
+      const result = await cdp.evalOnRunner(probe.commandsAroundExpr(tIdx, anchor, before, after, { mode }));
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -456,8 +473,19 @@ async function runMcp() {
       await ensureAttached();
       const rows = cdp.getNetworkLogs(args || {});
       const status = cdp.bufferStatus();
-      const header = `# network: ${status.totalNetSeen} requests seen, ${status.bufferedNetCount} buffered, ${rows.length} returned`;
-      if (rows.length === 0) return textResult(`${header}\n(no network requests matched filter)`);
+      const ageSec = Math.round((status.capturedSinceMs || 0) / 1000);
+      const header = `# network: ${status.totalNetSeen} requests seen, ${status.bufferedNetCount} buffered (since attach ${ageSec}s ago), ${rows.length} returned`;
+      if (rows.length === 0) {
+        // Distinguish "filter excluded everything" from "buffer is empty
+        // because you attached after the action". The latter is by far the
+        // most common surprise.
+        const hint = status.totalNetSeen === 0
+          ? `(buffer is empty — cypress-inspect attached ${ageSec}s ago and has seen 0 requests since. ` +
+            `If you ran the failing action BEFORE the MCP attached, those requests are gone. ` +
+            `Trigger \`rerun_spec\` (optionally after \`clear_app_state\`) to capture them.)`
+          : `(no network requests matched filter; buffer has ${status.bufferedNetCount} entries)`;
+        return textResult(`${header}\n${hint}`);
+      }
       const body = rows.map((r) => {
         const failMark = r.failed ? `FAIL ${r.failureText || ''} ` : '';
         const status = r.status != null ? r.status : '   ';
@@ -500,12 +528,94 @@ async function runMcp() {
     'rerun_spec',
     {
       title: 'Re-run the current spec from the top',
-      description: 'Triggers a full re-run of the currently-loaded spec (same as clicking "Run all tests" in the reporter). Tries `Cypress.emit("restart")` first, falls back to `window.location.reload()`. Cypress does not expose a "rerun failed only" hook — this is a full re-run. Often most useful after `clear_app_state`.',
-      inputSchema: {},
+      description: 'Triggers a full re-run of the currently-loaded spec (same as clicking "Run all tests" in the reporter). Tries `Cypress.emit("restart")` first, falls back to `window.location.reload()`. Cypress does not expose a "rerun failed only" hook — this is a full re-run.\n\nSet `await: true` to block until the runner is actually running again (the test count resets and a test moves into `running` state, or the spec finishes a new pass). Without `await`, returns immediately with a hint telling the agent to call `wait_for_failure` / `get_overview`. Often most useful via `reset_and_rerun`.',
+      inputSchema: {
+        await: z.boolean().optional(),
+        timeoutMs: z.number().int().positive().max(60000).optional(),
+      },
     },
-    async () => {
+    async ({ await: awaitFlag, timeoutMs = 15000 } = {}) => {
       await ensureAttached();
-      const result = await cdp.evalOnRunner(probe.RERUN_SPEC);
+      const before = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
+      const triggered = await cdp.evalOnRunner(probe.RERUN_SPEC);
+      const baseResponse = {
+        ...triggered,
+        triggered: true,
+        previousCounts: before?.counts || null,
+        hint: 'Call `get_overview` or `wait_for_failure` to observe the new run.',
+      };
+      if (!awaitFlag) return textResult(JSON.stringify(baseResponse, null, 2));
+      // Poll until totals reset (rerun started) or a test enters `running`.
+      const deadline = Date.now() + timeoutMs;
+      const baselineFailed = before?.counts?.failed ?? 0;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        const o = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
+        if (!o?.counts) continue;
+        const running = (o.counts.running || 0) > 0;
+        const reset = (o.counts.failed || 0) < baselineFailed || (o.counts.pending || 0) > 0;
+        if (running || reset) {
+          return textResult(JSON.stringify({ ...baseResponse, started: true, currentCounts: o.counts }, null, 2));
+        }
+      }
+      return textResult(JSON.stringify({ ...baseResponse, started: false, timedOut: true, waitedMs: timeoutMs }, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'reset_and_rerun',
+    {
+      title: 'Clear app state + rerun spec (one-shot)',
+      description: 'Convenience: `clear_app_state` then `rerun_spec` with `await: true`. The realistic combined workflow when a previous run left bad state behind. Returns both reports so the agent can confirm what was cleared and that the rerun actually started.',
+      inputSchema: {
+        timeoutMs: z.number().int().positive().max(60000).optional(),
+      },
+    },
+    async ({ timeoutMs = 15000 } = {}) => {
+      await ensureAttached();
+      const cleared = await cdp.evalOnRunner(probe.CLEAR_APP_STATE);
+      const before = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
+      const triggered = await cdp.evalOnRunner(probe.RERUN_SPEC);
+      const deadline = Date.now() + timeoutMs;
+      const baselineFailed = before?.counts?.failed ?? 0;
+      let started = false;
+      let currentCounts = null;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        const o = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
+        if (!o?.counts) continue;
+        currentCounts = o.counts;
+        if ((o.counts.running || 0) > 0 || (o.counts.failed || 0) < baselineFailed) {
+          started = true;
+          break;
+        }
+      }
+      return textResult(JSON.stringify({
+        cleared,
+        triggered,
+        started,
+        previousCounts: before?.counts || null,
+        currentCounts,
+        timedOut: !started,
+      }, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'get_indexeddb',
+    {
+      title: 'Read records from an IndexedDB store in the AUT',
+      description: 'Opens an IndexedDB database on the AUT iframe and either lists its object stores OR dumps records from one store. Designed for the PouchDB / offline-cache debugging case ("what is actually queued / cached?").\n\nUsage:\n  • `{ dbName }` — list stores: `[{ name, count, keyPath, autoIncrement }]`\n  • `{ dbName, store }` — dump records (default 25, max 500). Each value is JSON-stringified and clipped to `valueMaxBytes` (default 2 KB) so the payload stays manageable.\n\nFor larger or filtered reads use `eval` directly — this tool intentionally trades flexibility for ergonomics.',
+      inputSchema: {
+        dbName: z.string(),
+        store: z.string().optional(),
+        limit: z.number().int().positive().max(500).optional(),
+        valueMaxBytes: z.number().int().positive().max(50000).optional(),
+      },
+    },
+    async ({ dbName, store, limit = 25, valueMaxBytes = 2000 }) => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.getIndexedDbExpr(dbName, { store, limit, valueMaxBytes }));
       return textResult(JSON.stringify(result, null, 2));
     },
   );

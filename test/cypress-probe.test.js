@@ -52,6 +52,29 @@ test('findTestExpr: lowercases the query for case-insensitive match', () => {
   assert.match(e, /"plot description"/);
 });
 
+test('commandsAroundExpr: defaults to logical mode, embeds before/after', () => {
+  const e = probe.commandsAroundExpr(0, 10, 5, 5);
+  assert.match(e, /const before = 5/);
+  assert.match(e, /const after = 5/);
+  assert.match(e, /const mode = "logical"/);
+  assert.match(e, /uniqueNumbers/);
+});
+
+test('commandsAroundExpr: wrapper mode skips the logical-collapse path', () => {
+  const e = probe.commandsAroundExpr(0, 10, 5, 5, { mode: 'wrappers' });
+  assert.match(e, /const mode = "wrappers"/);
+});
+
+test('getIndexedDbExpr: embeds dbName and store when given', () => {
+  const list = probe.getIndexedDbExpr('myDb');
+  assert.match(list, /"myDb"/);
+  assert.match(list, /const wanted = null/);
+
+  const dump = probe.getIndexedDbExpr('myDb', { store: 'docs', limit: 50 });
+  assert.match(dump, /const wanted = "docs"/);
+  assert.match(dump, /records\.length >= 50/);
+});
+
 test('expandTestExpr / autDomExpr / commandsForTestExpr: safely embed numeric indices', () => {
   // No string-injection paths from unsanitised numbers — confirm only digits make it in.
   for (const fn of [probe.expandTestExpr, probe.autDomExpr, probe.commandsForTestExpr]) {

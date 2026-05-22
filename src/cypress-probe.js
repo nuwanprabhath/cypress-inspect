@@ -498,10 +498,15 @@ function commandsPagedForTestExpr(testIndex, { page = 0, pageSize = 50, full = f
   })()`;
 }
 
-// Commands around an anchor — useful for "what ran just before / after the
-// failed command". `anchor` is the wrapper DOM index, NOT the displayed
-// reporter number (use commandsSummary to look up the number → index).
-function commandsAroundExpr(testIndex, anchor, before = 5, after = 5, { argMaxBytes = 240, textMaxBytes = 300 } = {}) {
+// Commands around an anchor — "what ran just before / after the failed
+// command". `anchor` is a wrapper DOM index. Two modes:
+//   • mode='logical' (default) — `before`/`after` count LOGICAL commands
+//     (unique reporter numbers). Cypress renders one logical command as 2-3
+//     wrapper rows (parent + retries), so wrapper-based slicing exaggerates
+//     the window on retried chains. Logical mode is what humans expect.
+//   • mode='wrappers' — raw DOM-row counting. Use only if you need exact
+//     wrapper rows (e.g. for parent-row vs child-row diagnostics).
+function commandsAroundExpr(testIndex, anchor, before = 5, after = 5, { argMaxBytes = 240, textMaxBytes = 300, mode = 'logical' } = {}) {
   return `(() => {
     try {
       const all = [...document.querySelectorAll('.test.runnable')];
@@ -509,8 +514,40 @@ function commandsAroundExpr(testIndex, anchor, before = 5, after = 5, { argMaxBy
       if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
       const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
       const anchor = ${anchor};
-      const lo = Math.max(0, anchor - ${before});
-      const hi = Math.min(wrappers.length, anchor + ${after} + 1);
+      const before = ${before};
+      const after = ${after};
+      const mode = ${JSON.stringify(mode)};
+      let lo, hi;
+      if (mode === 'logical') {
+        // Build a list of unique reporter numbers in DOM order.
+        const numberAt = wrappers.map((w) => {
+          const n = w.querySelector('.command-number, [class*="command-number"]');
+          return n ? n.innerText.trim() : '';
+        });
+        const uniqueNumbers = [];
+        const firstIdxOfNumber = new Map();
+        const lastIdxOfNumber = new Map();
+        numberAt.forEach((num, i) => {
+          if (!num) return;
+          if (!firstIdxOfNumber.has(num)) { firstIdxOfNumber.set(num, i); uniqueNumbers.push(num); }
+          lastIdxOfNumber.set(num, i);
+        });
+        const anchorNumber = numberAt[anchor] || null;
+        const anchorLogicalIdx = anchorNumber != null ? uniqueNumbers.indexOf(anchorNumber) : -1;
+        if (anchorLogicalIdx < 0) {
+          // Anchor wrapper has no number (rare). Fall back to wrapper slicing.
+          lo = Math.max(0, anchor - before);
+          hi = Math.min(wrappers.length, anchor + after + 1);
+        } else {
+          const loLogical = Math.max(0, anchorLogicalIdx - before);
+          const hiLogical = Math.min(uniqueNumbers.length - 1, anchorLogicalIdx + after);
+          lo = firstIdxOfNumber.get(uniqueNumbers[loLogical]);
+          hi = lastIdxOfNumber.get(uniqueNumbers[hiLogical]) + 1;
+        }
+      } else {
+        lo = Math.max(0, anchor - before);
+        hi = Math.min(wrappers.length, anchor + after + 1);
+      }
       const cmds = wrappers.slice(lo, hi).map((w, j) => {
         const i = lo + j;
         const cls = w.className || '';
@@ -531,7 +568,7 @@ function commandsAroundExpr(testIndex, anchor, before = 5, after = 5, { argMaxBy
           text: textRaw.slice(0, ${textMaxBytes}),
         };
       });
-      return { anchor, before: ${before}, after: ${after}, lo, hi, total: wrappers.length, commands: cmds };
+      return { anchor, before, after, mode, lo, hi, total: wrappers.length, commands: cmds };
     } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
   })()`;
 }
@@ -635,6 +672,72 @@ const RERUN_SPEC = `(() => {
   } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
 })()`;
 
+// Open an IndexedDB database in the AUT iframe and either list its object
+// stores OR dump records from one store. Designed for the PouchDB / offline-
+// store debugging case: "what's actually queued / cached?". Each record's
+// value is JSON-stringified and clipped to `valueMaxBytes` to keep the
+// payload sane.
+function getIndexedDbExpr(dbName, { store = null, limit = 25, valueMaxBytes = 2000 } = {}) {
+  return `(async () => {
+    try {
+      const aut = document.querySelector('iframe.aut-iframe');
+      if (!aut || !aut.contentWindow) return { error: 'AUT iframe not found' };
+      const w = aut.contentWindow;
+      if (!w.indexedDB) return { error: 'indexedDB not available on AUT' };
+      const db = await new Promise((res, rej) => {
+        const req = w.indexedDB.open(${JSON.stringify(dbName)});
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+        req.onblocked = () => rej(new Error('open blocked'));
+      });
+      const stores = [...db.objectStoreNames];
+      const wanted = ${JSON.stringify(store)};
+      if (!wanted) {
+        // Just list stores + record count per store.
+        const summary = [];
+        for (const name of stores) {
+          try {
+            const tx = db.transaction(name, 'readonly');
+            const s = tx.objectStore(name);
+            const count = await new Promise((res, rej) => {
+              const r = s.count();
+              r.onsuccess = () => res(r.result);
+              r.onerror = () => rej(r.error);
+            });
+            summary.push({ name, count, keyPath: s.keyPath, autoIncrement: s.autoIncrement });
+          } catch (e) { summary.push({ name, error: String(e && e.message || e) }); }
+        }
+        db.close();
+        return { db: ${JSON.stringify(dbName)}, version: db.version, stores: summary };
+      }
+      if (!stores.includes(wanted)) {
+        db.close();
+        return { error: 'No such object store: ' + wanted, availableStores: stores };
+      }
+      const records = [];
+      let truncatedAt = null;
+      await new Promise((res, rej) => {
+        const tx = db.transaction(wanted, 'readonly');
+        const s = tx.objectStore(wanted);
+        const cur = s.openCursor();
+        cur.onerror = () => rej(cur.error);
+        cur.onsuccess = (ev) => {
+          const c = ev.target.result;
+          if (!c) return res();
+          if (records.length >= ${limit}) { truncatedAt = records.length; return res(); }
+          let v = c.value;
+          try { v = JSON.stringify(v); } catch (e) { v = String(v); }
+          if (v && v.length > ${valueMaxBytes}) { v = v.slice(0, ${valueMaxBytes}) + '... [truncated]'; }
+          records.push({ key: c.primaryKey, value: v });
+          c.continue();
+        };
+      });
+      db.close();
+      return { db: ${JSON.stringify(dbName)}, store: wanted, returned: records.length, truncatedAt, records };
+    } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
+  })()`;
+}
+
 module.exports = {
   OVERVIEW,
   FAILURES,
@@ -651,6 +754,7 @@ module.exports = {
   commandsSummaryForTestExpr,
   commandsPagedForTestExpr,
   commandsAroundExpr,
+  getIndexedDbExpr,
   stepToExpr,
   autDomExpr,
   findTestExpr,
