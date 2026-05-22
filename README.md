@@ -65,6 +65,9 @@ It works by attaching to Cypress's test browser via the Chrome DevTools Protocol
 | Command log & time-travel (`get_test_commands`, `step_to`) | `Runtime.evaluate` reads `.command-wrapper` rows; `step_to` simulates a click on the target row to pin the AUT snapshot |
 | Live test state (`get_live_commands`) | `Runtime.evaluate` → `window.Cypress.cy.queue` |
 | AUT page info (`get_aut_info`) | `Runtime.evaluate` → `iframe.aut-iframe.contentWindow.location`, `document.title`, `readyState` |
+| Network requests (`get_network_logs`) | CDP `Network.requestWillBeSent` / `responseReceived` / `loadingFailed` events, buffered (cap 2 000) |
+| Storage snapshots (`get_storage`) | `Runtime.evaluate` → reads `localStorage` / `sessionStorage` / `indexedDB.databases()` from the AUT iframe |
+| Failure classification | Pure heuristic over the failure payload + flake signals — `src/failure-classifier.js` |
 
 ## How it works
 
@@ -82,14 +85,34 @@ cd ~/projects/pet-projects/cypress-inspect
 npm install
 ```
 
+### Expose the `cypress-inspect` command globally (recommended)
+
+Run this once from the cloned repo directory:
+
+```bash
+cd ~/projects/pet-projects/cypress-inspect
+npm link
+```
+
+`npm link` symlinks the `cypress-inspect` binary into your global Node bin directory (e.g. `/usr/local/bin/cypress-inspect` or `~/.nvm/versions/node/<v>/bin/cypress-inspect`), so you can run it from *any* project:
+
+```bash
+which cypress-inspect          # confirm the symlink resolves
+cd ~/projects/my-webapp
+cypress-inspect open           # launches Cypress for the project you're in
+```
+
+To remove the global symlink later: `npm unlink -g cypress-inspect` (from anywhere) or `npm unlink` from the repo.
+
 ### Claude Code
 
 Register globally (works across all worktrees and projects):
 
 ```bash
-claude mcp add --scope user cypress-inspect \
-  node /absolute/path/to/cypress-inspect/bin/cypress-inspect.js mcp
+claude mcp add --scope user cypress-inspect cypress-inspect mcp
 ```
+
+(That's not a typo — `cypress-inspect` is both the MCP server name and the linked binary. If you skipped `npm link`, substitute `node /absolute/path/to/cypress-inspect/bin/cypress-inspect.js` for the binary.)
 
 Verify with `claude mcp list` and `/mcp` inside a Claude session.
 
@@ -106,12 +129,14 @@ Create `.vscode/mcp.json` in your webapp project:
   "servers": {
     "cypress-inspect": {
       "type": "stdio",
-      "command": "node",
-      "args": ["/absolute/path/to/cypress-inspect/bin/cypress-inspect.js", "mcp"]
+      "command": "cypress-inspect",
+      "args": ["mcp"]
     }
   }
 }
 ```
+
+(Requires `npm link`. Without the link, replace `"command": "cypress-inspect"` with `"command": "node"` and `"args": ["/absolute/path/to/cypress-inspect/bin/cypress-inspect.js", "mcp"]`.)
 
 **User-level** (applies to every workspace you open):
 
@@ -123,8 +148,8 @@ Open VS Code settings (`Cmd+,`), switch to JSON (`Open User Settings (JSON)`), a
     "servers": {
       "cypress-inspect": {
         "type": "stdio",
-        "command": "node",
-        "args": ["/absolute/path/to/cypress-inspect/bin/cypress-inspect.js", "mcp"]
+        "command": "cypress-inspect",
+        "args": ["mcp"]
       }
     }
   }
@@ -153,14 +178,15 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 
    > "A Cypress test failed. Use cypress-inspect to debug it. Start with `get_overview`, then `get_failures` for the full list, then `step_to` and `get_dom` to inspect the state at the failing command."
 
-## Tools (v0.7)
+## Tools (v0.8)
 
 ### Orientation
 | Tool | Use |
 | --- | --- |
 | `status` | Session info + attached CDP targets. Always call if something returns "no Cypress". |
 | `get_overview` | **Start here.** Spec file, pass/fail/pending counts, first failure (title + suite + error + stack + code frame), live test if any. |
-| `get_failures` `{ dedupe? }` | All failed tests with error/stack/code-frame. Auto-tags `rootCause: true` on the first failure + `looksLikeCascade` / `cascadeOf` on downstream ones. Each failure also includes `relatedCommandIndex` / `relatedCommandNumber` pointing at the failed command in the reporter so the agent can `step_to` directly, and `cypressDocsHints: [{ command, url }]` linking every `cy.<command>` mentioned in the error to its docs page. Compare-style errors are parsed into `parsedDiff.diffs: [{ path, pathSegments, expected, actual }]`. Top-level `flakeSignals` is populated from TWO sources merged by id: the CDP console buffer **and** the reporter command-log (`/WARNING:/i` rows) — important because Cypress wraps `console.*` in the AUT iframe so the CDP buffer often misses warnings. Matching IDs also attach to the root failure. `dedupe: true` adds `rootCauses: [<index>]` and splits cascading failures into a separate array. |
+| `get_failures` `{ dedupe? }` | All failed tests with error/stack/code-frame. Auto-tags `rootCause: true` on the first failure + `looksLikeCascade` / `cascadeOf` on downstream ones. Each failure also includes:<br>• `relatedCommandIndex` / `relatedCommandNumber` pointing at the failed command in the reporter so the agent can `step_to` directly<br>• `cypressDocsHints: [{ command, url }]` linking every `cy.<command>` mentioned in the error to its docs page<br>• `classification: { category, confidence, explain, evidence }` — stable named cause (`compare_diff`, `dropdown_ambiguity`, `selector_not_found`, `route_mismatch`, `network_failure`, `timeout_cascade`, `stale_local_state`, `unknown`)<br>Compare-style errors are parsed into `parsedDiff.diffs: [{ path, pathSegments, expected, actual }]`. Top-level `flakeSignals` is populated from TWO sources merged by id: the CDP console buffer **and** the reporter command-log (`/WARNING:/i` rows) — important because Cypress wraps `console.*` in the AUT iframe so the CDP buffer often misses warnings. Matching IDs also attach to the root failure. `dedupe: true` adds `rootCauses: [<index>]` and splits cascading failures into a separate array. |
+| `get_failure_context` `{ failureIndex \| testIndex, commandIndex?, before?, after? }` | The N commands before and M after the failing command (defaults 5/5). Skips the manual slice agents usually have to do after `get_failures`. |
 | `parse_compare_error` `{ message }` | Standalone parser for "Compare - FAILURES" / "InProgress Summary Widget comparison failed" strings. Returns `{ summary: { failed, total }, diffs: [...] }`. |
 | `list_tests` | Lightweight list of every test with state + title + suite ancestry. Use returned `index` with the next two tools. |
 | `find_test` `{ query }` | Partial-title search across tests. Returns matches with index + state. Faster than scanning `list_tests`. |
@@ -169,6 +195,8 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 | Tool | Use |
 | --- | --- |
 | `get_test_commands` `{ index, full? }` | Commands rendered for the test at that reporter index. Each entry has `number` (display, may repeat across rows), `index` (unique DOM position), plus `argTruncated`/`argLength` markers. `full: true` returns untruncated args + text. Response also includes `numberToIndex` to resolve a displayed reporter number to a DOM index. |
+| `get_test_commands_summary` `{ index }` | Triage view: one row per UNIQUE displayed command number (`name`, short `arg`, `state`). Designed for complex tests where the full command list busts the token budget. Also surfaces `firstFailedNumber` for fast `step_to`. |
+| `get_test_commands_page` `{ index, page?, pageSize?, full? }` | Paged variant of `get_test_commands` — returns one slice at a time with `start/end/total/hasMore`. Use when `get_test_commands` would truncate. |
 | `get_live_commands` | `Cypress.cy.queue` for the in-flight test only. |
 | `step_to` `{ testIndex, commandIndex \| commandNumber }` | Time-travel: pin the AUT snapshot to that command. Prefer `commandNumber` (the visible reporter number) — it's what humans see. Falls back to `commandIndex` (raw DOM position) when you need to disambiguate duplicated rows. Expands the panel if collapsed. |
 | `expand_test` `{ index }` | Open a test panel without pinning a command. Useful when you just want to read commands or the error block. |
@@ -183,6 +211,20 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 | `get_dom` `{ selector?, maxBytes? }` | Rendered HTML of the AUT iframe at the currently-pinned snapshot. |
 | `find_in_aut` `{ selector, limit?, textOnly? }` | Run a CSS selector against the AUT. Default: compact JSON per match (tag, attrs, text, textTruncated, textLength, value, visible, disabled). `textOnly: true` returns just the **full untruncated text** of each match — best for summary widgets or anything where you only care what the user reads. |
 | `get_aut_info` | AUT iframe src + location (href/pathname/hash/search) + document.title + readyState + navigator.onLine. Also returns a `capture` block with attached targets, execution contexts (with origin / aux frame data), and total events seen — useful for diagnosing why a console.* call might not be reaching the buffer. |
+| `get_failure_dom` `{ failureIndex, selector?, maxBytes? }` | Convenience: `step_to` the failing command, then `get_dom`. Returns the AUT DOM at the moment of failure in one tool call. |
+
+### Network
+| Tool | Use |
+| --- | --- |
+| `get_network_logs` `{ grep?, since?, statusMin?, statusMax?, failedOnly?, limit? }` | CDP-buffered HTTP requests. Filter by URL regex, status range, or `failedOnly: true` (failed OR ≥400). Each row: method / url / status / mime / durationMs / failed / failureText. Bodies are NOT captured — use `eval` if needed. |
+
+### App state / control
+| Tool | Use |
+| --- | --- |
+| `get_storage` | Snapshot of localStorage, sessionStorage, cookies, and IndexedDB database names from the AUT iframe. Each value clipped to 1 KB. Use to diagnose stale-state flakes (cached auth, partially-synced PouchDB databases). |
+| `clear_app_state` | **Write operation.** Clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database in the AUT. Returns counts of what was cleared. |
+| `rerun_spec` | Re-run the current spec from the top. Tries `Cypress.emit("restart")`, falls back to `location.reload()`. (Cypress does not expose "rerun failed only".) Pair with `clear_app_state` for a clean-slate re-run. |
+| `wait_for_failure` `{ baseline?, timeoutMs?, pollMs? }` | Block until the failure count grows past `baseline` (or current count) and return the new failure. Lets a watch-mode agent react to the next failure without the user nudging it. Timeout default 60 s, max 120 s. |
 
 ### Docs & static analysis
 | Tool | Use |

@@ -1,4 +1,5 @@
 const { docsHintsForFailure } = require('./cypress-docs');
+const { classifyFailure } = require('./failure-classifier');
 
 // Post-processors for the raw `failures` payload returned by cypress-probe.
 
@@ -153,6 +154,10 @@ function augmentFailures(payload, { dedupe = false, logs = null, reporterWarning
       f.rootCause ? { ...f, flakeSignals: flakeSignals.map((s) => s.id) } : f,
     );
   }
+
+  // Classification runs AFTER cascade + flake-signal annotation so the
+  // classifier can use those fields as inputs.
+  failures = failures.map((f) => ({ ...f, classification: classifyFailure(f) }));
 
   if (dedupe) {
     const root = failures.filter((f) => f.rootCause);

@@ -25,7 +25,7 @@ async function runMcp() {
     attached = true;
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.7.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.8.0' });
 
   // ───────────────────────────── orientation ─────────────────────────────
 
@@ -160,6 +160,70 @@ async function runMcp() {
     async () => {
       await ensureAttached();
       const result = await cdp.evalOnRunner(probe.LIVE_COMMANDS);
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'get_test_commands_summary',
+    {
+      title: 'Lightweight command summary (triage view)',
+      description: 'Returns one row per UNIQUE displayed command number — name, arg (≤80 chars), state. Cypress renders one logical command as 2-3 wrapper rows; this view collapses them. Designed for triage on complex tests where `get_test_commands` busts the token budget. Also returns `firstFailedNumber` for fast jumps via `step_to`.',
+      inputSchema: { index: z.number().int().nonnegative() },
+    },
+    async ({ index }) => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.commandsSummaryForTestExpr(index));
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'get_test_commands_page',
+    {
+      title: 'Paged command log (for huge tests)',
+      description: 'Same shape as `get_test_commands` but returns one page of wrappers (default 50). Pass `{ index, page, pageSize?, full? }`. Response includes `start/end/total/hasMore` so the caller can iterate. Use when `get_test_commands` truncation breaks your debugging flow.',
+      inputSchema: {
+        index: z.number().int().nonnegative(),
+        page: z.number().int().nonnegative().optional(),
+        pageSize: z.number().int().positive().max(500).optional(),
+        full: z.boolean().optional(),
+      },
+    },
+    async ({ index, page = 0, pageSize = 50, full = false }) => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.commandsPagedForTestExpr(index, { page, pageSize, full }));
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'get_failure_context',
+    {
+      title: 'Commands before / after the failing command',
+      description: 'Returns the N commands BEFORE and M AFTER the failing command in a given failed test (default 5 / 5). Resolves the anchor from either `failureIndex` (a test\'s reporter index — finds the failed command in it) or an explicit `{ testIndex, commandIndex }`. The most common follow-up to `get_failures` — skips manual slicing.',
+      inputSchema: {
+        failureIndex: z.number().int().nonnegative().optional(),
+        testIndex: z.number().int().nonnegative().optional(),
+        commandIndex: z.number().int().nonnegative().optional(),
+        before: z.number().int().nonnegative().max(50).optional(),
+        after: z.number().int().nonnegative().max(50).optional(),
+      },
+    },
+    async ({ failureIndex, testIndex, commandIndex, before = 5, after = 5 }) => {
+      await ensureAttached();
+      let tIdx = testIndex;
+      let anchor = commandIndex;
+      if (tIdx == null && failureIndex != null) tIdx = failureIndex;
+      if (tIdx == null) return textResult('Pass either failureIndex or testIndex.');
+      if (anchor == null) {
+        const failures = await cdp.evalOnRunner(probe.FAILURES);
+        const f = (failures?.failures || []).find((x) => x.index === tIdx);
+        if (!f) return textResult(`No failed test at index ${tIdx}`);
+        anchor = f.relatedCommandIndex;
+        if (anchor == null) return textResult(`No failed command found in test ${tIdx}.`);
+      }
+      const result = await cdp.evalOnRunner(probe.commandsAroundExpr(tIdx, anchor, before, after));
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -369,6 +433,143 @@ async function runMcp() {
           contexts: status.contexts,
         },
       }, null, 2));
+    },
+  );
+
+  // ───────────────────────────── network / storage / control ─────────────────
+
+  server.registerTool(
+    'get_network_logs',
+    {
+      title: 'Buffered network requests',
+      description: 'CDP-captured network requests since the MCP server attached. Filters: `grep` (case-insensitive regex on URL), `since` (epoch ms), `statusMin/statusMax`, `failedOnly: true` (shorthand for failed OR status >= 400), `limit` (default 100). Each entry: `{ method, url, status, mime, durationMs, failed, failureText, ts }`. Body content is intentionally NOT captured — use `eval` if you need it.',
+      inputSchema: {
+        grep: z.string().optional(),
+        since: z.number().optional(),
+        statusMin: z.number().int().optional(),
+        statusMax: z.number().int().optional(),
+        failedOnly: z.boolean().optional(),
+        limit: z.number().int().positive().max(1000).optional(),
+      },
+    },
+    async (args) => {
+      await ensureAttached();
+      const rows = cdp.getNetworkLogs(args || {});
+      const status = cdp.bufferStatus();
+      const header = `# network: ${status.totalNetSeen} requests seen, ${status.bufferedNetCount} buffered, ${rows.length} returned`;
+      if (rows.length === 0) return textResult(`${header}\n(no network requests matched filter)`);
+      const body = rows.map((r) => {
+        const failMark = r.failed ? `FAIL ${r.failureText || ''} ` : '';
+        const status = r.status != null ? r.status : '   ';
+        const dur = r.durationMs != null ? `${r.durationMs}ms` : '    ';
+        return `[${new Date(r.ts).toISOString().slice(11, 23)}] ${failMark}${status} ${dur} ${r.method || ''} ${r.url}`;
+      }).join('\n');
+      return textResult(`${header}\n${body}`);
+    },
+  );
+
+  server.registerTool(
+    'get_storage',
+    {
+      title: 'Snapshot localStorage / sessionStorage / IndexedDB / cookies',
+      description: 'Read-only snapshot of the AUT iframe storage. Returns:\n  • `localStorage` — every key/value (each value clipped to 1 KB)\n  • `sessionStorage` — same shape\n  • `indexedDB` — list of `{ name, version }` from indexedDB.databases() (object store contents NOT dumped; use `eval` for that)\n  • `cookies` — document.cookie string\n\nUse to diagnose flakes caused by stale local state from a previous run (auth tokens, cached models, partially-synced PouchDB databases).',
+      inputSchema: {},
+    },
+    async () => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.STORAGE_SNAPSHOT);
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'clear_app_state',
+    {
+      title: 'Clear localStorage / sessionStorage / cookies / IndexedDB (AUT)',
+      description: 'Best-effort wipe of the app-under-test storage: clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database listed by indexedDB.databases(). Returns the count of each. Pair with `rerun_spec` for a clean-slate re-run. WRITE OPERATION on the app — use deliberately.',
+      inputSchema: {},
+    },
+    async () => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.CLEAR_APP_STATE);
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'rerun_spec',
+    {
+      title: 'Re-run the current spec from the top',
+      description: 'Triggers a full re-run of the currently-loaded spec (same as clicking "Run all tests" in the reporter). Tries `Cypress.emit("restart")` first, falls back to `window.location.reload()`. Cypress does not expose a "rerun failed only" hook — this is a full re-run. Often most useful after `clear_app_state`.',
+      inputSchema: {},
+    },
+    async () => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.RERUN_SPEC);
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'get_failure_dom',
+    {
+      title: 'DOM at the failure frame (convenience: step_to + get_dom)',
+      description: 'For a failed test, time-travel to the failing command and return the AUT DOM at that snapshot. Combines `step_to` + `get_dom` so you don\'t have to chain them. Pass `failureIndex` (the test index) and optional `selector` / `maxBytes`.',
+      inputSchema: {
+        failureIndex: z.number().int().nonnegative(),
+        selector: z.string().optional(),
+        maxBytes: z.number().int().positive().max(1_000_000).optional(),
+      },
+    },
+    async ({ failureIndex, selector, maxBytes = 100_000 }) => {
+      await ensureAttached();
+      const failures = await cdp.evalOnRunner(probe.FAILURES);
+      const f = (failures?.failures || []).find((x) => x.index === failureIndex);
+      if (!f) return textResult(`No failed test at index ${failureIndex}`);
+      if (f.relatedCommandIndex == null && !f.relatedCommandNumber) {
+        return textResult(`Failed test ${failureIndex} has no identified failing command. Try step_to manually.`);
+      }
+      const stepped = await cdp.evalOnRunner(
+        probe.stepToExpr(failureIndex, {
+          commandIndex: f.relatedCommandIndex,
+          commandNumber: f.relatedCommandNumber,
+        }),
+      );
+      const dom = await cdp.evalOnRunner(probe.autDomExpr(selector, maxBytes));
+      if (dom?.error) return textResult(`step_to=${JSON.stringify(stepped)}\nDOM error: ${dom.error}`);
+      const header = `# pinned: ${JSON.stringify(stepped)}\n# AUT URL: ${dom.url}\n# Total bytes: ${dom.length}\n---\n`;
+      return textResult(header + dom.html);
+    },
+  );
+
+  server.registerTool(
+    'wait_for_failure',
+    {
+      title: 'Block until the failure count grows (or timeout)',
+      description: 'Polls the reporter until the failed-test count exceeds `baseline` (default: current count). Returns the new failure when it appears, or `{ timedOut: true }` after `timeoutMs` (max 120000, default 60000). Use this in a watch loop: call `get_overview` to capture baseline, then ask the agent to call `wait_for_failure { baseline }` so it can react to the next failure without you having to nudge it.',
+      inputSchema: {
+        baseline: z.number().int().nonnegative().optional(),
+        timeoutMs: z.number().int().positive().max(120000).optional(),
+        pollMs: z.number().int().positive().max(5000).optional(),
+      },
+    },
+    async ({ baseline, timeoutMs = 60000, pollMs = 1000 }) => {
+      await ensureAttached();
+      let base = baseline;
+      if (base == null) {
+        const o = await cdp.evalOnRunner(probe.OVERVIEW);
+        base = o?.counts?.failed ?? 0;
+      }
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const o = await cdp.evalOnRunner(probe.OVERVIEW);
+        const failed = o?.counts?.failed ?? 0;
+        if (failed > base) {
+          return textResult(JSON.stringify({ baseline: base, currentFailed: failed, firstFailure: o.firstFailure }, null, 2));
+        }
+        await new Promise((r) => setTimeout(r, pollMs));
+      }
+      return textResult(JSON.stringify({ timedOut: true, baseline: base, waitedMs: timeoutMs }, null, 2));
     },
   );
 

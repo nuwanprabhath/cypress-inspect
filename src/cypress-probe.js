@@ -410,6 +410,231 @@ const AUT_RECT = `(() => {
   return { x: r.x, y: r.y, width: r.width, height: r.height, scale: 1 };
 })()`;
 
+// Compact commands view — one row per UNIQUE command number with state +
+// name + truncated arg. Designed for triage: an agent can scan 200 commands
+// in a few KB instead of the 70K+ that the full wrapper view costs.
+function commandsSummaryForTestExpr(testIndex) {
+  return `(() => {
+    try {
+      const all = [...document.querySelectorAll('.test.runnable')];
+      const el = all[${testIndex}];
+      if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
+      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      const byNumber = new Map();
+      wrappers.forEach((w, i) => {
+        const numEl = w.querySelector('.command-number, [class*="command-number"]');
+        const number = numEl ? numEl.innerText.trim() : '';
+        if (!number || byNumber.has(number)) return;
+        const cls = w.className || '';
+        const stateMatch = cls.match(/command-state-(\\w+)/);
+        const nameEl = w.querySelector('.command-method, [class*="command-method"]');
+        const argEl = w.querySelector('.command-message, [class*="command-message"]');
+        const argRaw = argEl ? argEl.innerText.trim() : null;
+        byNumber.set(number, {
+          number,
+          index: i,
+          name: nameEl ? nameEl.innerText.trim() : null,
+          arg: argRaw == null ? null : argRaw.slice(0, 80),
+          argLength: argRaw == null ? 0 : argRaw.length,
+          state: stateMatch ? stateMatch[1] : null,
+        });
+      });
+      const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
+      const commands = [...byNumber.values()];
+      const failedIdx = commands.findIndex((c) => c.state === 'failed');
+      return {
+        testTitle: titleEl ? titleEl.innerText.split('\\n')[0].trim() : null,
+        wrapperRowCount: wrappers.length,
+        commandCount: commands.length,
+        firstFailedNumber: failedIdx >= 0 ? commands[failedIdx].number : null,
+        commands,
+      };
+    } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
+  })()`;
+}
+
+// Paged version of commandsForTestExpr — returns wrappers[start .. start+size].
+function commandsPagedForTestExpr(testIndex, { page = 0, pageSize = 50, full = false, argMaxBytes = 240, textMaxBytes = 300 } = {}) {
+  const start = page * pageSize;
+  return `(() => {
+    try {
+      const all = [...document.querySelectorAll('.test.runnable')];
+      const el = all[${testIndex}];
+      if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
+      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      const total = wrappers.length;
+      const start = ${start};
+      const end = Math.min(start + ${pageSize}, total);
+      const slice = wrappers.slice(start, end);
+      const cmds = slice.map((w, j) => {
+        const i = start + j;
+        const cls = w.className || '';
+        const stateMatch = cls.match(/command-state-(\\w+)/);
+        const nameEl = w.querySelector('.command-method, [class*="command-method"]');
+        const argEl = w.querySelector('.command-message, [class*="command-message"]');
+        const numEl = w.querySelector('.command-number, [class*="command-number"]');
+        const argRaw = argEl ? argEl.innerText.trim() : null;
+        const textRaw = w.innerText.trim();
+        return {
+          index: i,
+          number: numEl ? numEl.innerText.trim() : null,
+          name: nameEl ? nameEl.innerText.trim() : null,
+          arg: argRaw == null ? null : (${full} ? argRaw : argRaw.slice(0, ${argMaxBytes})),
+          argTruncated: !${full} && !!argRaw && argRaw.length > ${argMaxBytes},
+          argLength: argRaw == null ? 0 : argRaw.length,
+          state: stateMatch ? stateMatch[1] : null,
+          text: ${full} ? textRaw : textRaw.slice(0, ${textMaxBytes}),
+          textTruncated: !${full} && textRaw.length > ${textMaxBytes},
+        };
+      });
+      return {
+        page: ${page},
+        pageSize: ${pageSize},
+        start, end, total,
+        hasMore: end < total,
+        commands: cmds,
+      };
+    } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
+  })()`;
+}
+
+// Commands around an anchor — useful for "what ran just before / after the
+// failed command". `anchor` is the wrapper DOM index, NOT the displayed
+// reporter number (use commandsSummary to look up the number → index).
+function commandsAroundExpr(testIndex, anchor, before = 5, after = 5, { argMaxBytes = 240, textMaxBytes = 300 } = {}) {
+  return `(() => {
+    try {
+      const all = [...document.querySelectorAll('.test.runnable')];
+      const el = all[${testIndex}];
+      if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
+      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      const anchor = ${anchor};
+      const lo = Math.max(0, anchor - ${before});
+      const hi = Math.min(wrappers.length, anchor + ${after} + 1);
+      const cmds = wrappers.slice(lo, hi).map((w, j) => {
+        const i = lo + j;
+        const cls = w.className || '';
+        const stateMatch = cls.match(/command-state-(\\w+)/);
+        const nameEl = w.querySelector('.command-method, [class*="command-method"]');
+        const argEl = w.querySelector('.command-message, [class*="command-message"]');
+        const numEl = w.querySelector('.command-number, [class*="command-number"]');
+        const argRaw = argEl ? argEl.innerText.trim() : null;
+        const textRaw = w.innerText.trim();
+        return {
+          index: i,
+          isAnchor: i === anchor,
+          number: numEl ? numEl.innerText.trim() : null,
+          name: nameEl ? nameEl.innerText.trim() : null,
+          arg: argRaw == null ? null : argRaw.slice(0, ${argMaxBytes}),
+          argLength: argRaw == null ? 0 : argRaw.length,
+          state: stateMatch ? stateMatch[1] : null,
+          text: textRaw.slice(0, ${textMaxBytes}),
+        };
+      });
+      return { anchor, before: ${before}, after: ${after}, lo, hi, total: wrappers.length, commands: cmds };
+    } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
+  })()`;
+}
+
+// AUT-iframe storage snapshot: localStorage + sessionStorage + IndexedDB
+// database names. IndexedDB.databases() is async, so we mark this expression
+// as awaitPromise=true on the evaluator side.
+const STORAGE_SNAPSHOT = `(async () => {
+  try {
+    const aut = document.querySelector('iframe.aut-iframe');
+    if (!aut || !aut.contentWindow) return { error: 'AUT iframe not found' };
+    const w = aut.contentWindow;
+    const ls = {};
+    try {
+      for (let i = 0; i < w.localStorage.length; i++) {
+        const k = w.localStorage.key(i);
+        const v = w.localStorage.getItem(k);
+        ls[k] = (v || '').length > 1000 ? v.slice(0, 1000) + '... [truncated]' : v;
+      }
+    } catch (e) { ls.__error = String(e && e.message || e); }
+    const ss = {};
+    try {
+      for (let i = 0; i < w.sessionStorage.length; i++) {
+        const k = w.sessionStorage.key(i);
+        const v = w.sessionStorage.getItem(k);
+        ss[k] = (v || '').length > 1000 ? v.slice(0, 1000) + '... [truncated]' : v;
+      }
+    } catch (e) { ss.__error = String(e && e.message || e); }
+    let dbs = null;
+    try {
+      if (w.indexedDB && typeof w.indexedDB.databases === 'function') {
+        dbs = await w.indexedDB.databases();
+      }
+    } catch (e) { dbs = { error: String(e && e.message || e) }; }
+    let cookies = null;
+    try { cookies = aut.contentDocument.cookie || ''; } catch (e) { cookies = String(e && e.message || e); }
+    return {
+      url: aut.src,
+      localStorage: ls,
+      localStorageKeys: Object.keys(ls).length,
+      sessionStorage: ss,
+      sessionStorageKeys: Object.keys(ss).length,
+      indexedDB: dbs,
+      cookies,
+    };
+  } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
+})()`;
+
+// Clear browser state for the AUT iframe. Best-effort: clears localStorage,
+// sessionStorage, cookies (path=/ on current host), and deletes every named
+// IndexedDB database. Returns the names of what was cleared.
+const CLEAR_APP_STATE = `(async () => {
+  const report = { localStorage: 0, sessionStorage: 0, cookies: 0, databasesDeleted: [], errors: [] };
+  try {
+    const aut = document.querySelector('iframe.aut-iframe');
+    if (!aut || !aut.contentWindow) return { error: 'AUT iframe not found' };
+    const w = aut.contentWindow;
+    const d = aut.contentDocument;
+    try { report.localStorage = w.localStorage.length; w.localStorage.clear(); } catch (e) { report.errors.push('localStorage: ' + e.message); }
+    try { report.sessionStorage = w.sessionStorage.length; w.sessionStorage.clear(); } catch (e) { report.errors.push('sessionStorage: ' + e.message); }
+    try {
+      const cookies = (d.cookie || '').split(';');
+      report.cookies = cookies.filter(Boolean).length;
+      for (const c of cookies) {
+        const name = c.split('=')[0].trim();
+        if (!name) continue;
+        d.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/;';
+      }
+    } catch (e) { report.errors.push('cookies: ' + e.message); }
+    try {
+      if (w.indexedDB && typeof w.indexedDB.databases === 'function') {
+        const dbs = await w.indexedDB.databases();
+        for (const db of dbs) {
+          if (db.name) {
+            await new Promise((resolve) => {
+              const req = w.indexedDB.deleteDatabase(db.name);
+              req.onsuccess = req.onerror = req.onblocked = () => resolve();
+            });
+            report.databasesDeleted.push(db.name);
+          }
+        }
+      }
+    } catch (e) { report.errors.push('indexedDB: ' + e.message); }
+    return report;
+  } catch (e) { return { error: String(e && e.stack || e && e.message || e), report }; }
+})()`;
+
+// Reload the currently-running spec — same effect as clicking the reporter's
+// "Rerun all tests" affordance. Cypress doesn't expose a "rerun failed only"
+// API, so this is the full-spec rerun. Pair with clear_app_state for a clean
+// start.
+const RERUN_SPEC = `(() => {
+  try {
+    if (window.Cypress && window.Cypress.cy) {
+      // Best path: Cypress emits "restart" on its bus to rerun the spec.
+      try { window.Cypress.emit('restart'); return { ok: true, via: 'Cypress.emit(restart)' }; } catch (e) {}
+    }
+    // Fallback — reload the spec runner page entirely.
+    window.location.reload();
+    return { ok: true, via: 'location.reload()' };
+  } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+})()`;
+
 module.exports = {
   OVERVIEW,
   FAILURES,
@@ -419,7 +644,13 @@ module.exports = {
   AUT_INFO,
   PINNED_COMMAND,
   REPORTER_WARNINGS,
+  STORAGE_SNAPSHOT,
+  CLEAR_APP_STATE,
+  RERUN_SPEC,
   commandsForTestExpr,
+  commandsSummaryForTestExpr,
+  commandsPagedForTestExpr,
+  commandsAroundExpr,
   stepToExpr,
   autDomExpr,
   findTestExpr,

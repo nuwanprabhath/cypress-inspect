@@ -2,16 +2,20 @@ const CDP = require('chrome-remote-interface');
 
 // Ring buffer of recent console messages across all attached targets.
 const MAX_LOGS = 5000;
+const MAX_NET = 2000;
 
 class CdpClient {
   constructor() {
     this.port = null;
     this.targets = new Map(); // targetId -> { client, info, kind, contexts }
     this.logs = [];
+    this.network = new Map(); // requestId -> entry
+    this.netOrder = []; // requestIds in arrival order (for ring buffer)
     this.lastError = null;
     this.refreshTimer = null;
     this.attachedAt = null;
     this.totalLogsSeen = 0;
+    this.totalNetSeen = 0;
   }
 
   async attach(port) {
@@ -70,10 +74,11 @@ class CdpClient {
   async attachTarget(info, kind) {
     try {
       const client = await CDP({ target: info.webSocketDebuggerUrl, local: false });
-      const { Runtime, Log, Page } = client;
+      const { Runtime, Log, Page, Network } = client;
       await Runtime.enable();
       await Log.enable().catch(() => {});
       await Page.enable().catch(() => {});
+      await Network.enable().catch(() => {});
 
       const record = { client, info, kind, contexts: new Map() };
       this.targets.set(info.id, record);
@@ -131,6 +136,49 @@ class CdpClient {
         });
       });
 
+      // Network capture — we record only the fields useful for debugging
+      // (method, URL, status, mime, duration, failure reason). Body is
+      // deliberately NOT fetched: response bodies can be enormous and would
+      // dominate the ring buffer. Callers wanting a body can use `eval`.
+      Network.requestWillBeSent?.((params) => {
+        this.totalNetSeen++;
+        const id = params.requestId;
+        const r = params.request || {};
+        const entry = {
+          id,
+          ts: Math.round((params.timestamp || 0) * 1000) || Date.now(),
+          method: r.method || null,
+          url: r.url || null,
+          resourceType: params.type || null,
+          initiator: params.initiator?.type || null,
+          kind,
+          targetId: info.id,
+          status: null,
+          statusText: null,
+          mime: null,
+          fromCache: false,
+          failed: false,
+          failureText: null,
+          durationMs: null,
+        };
+        this.pushNet(entry);
+      });
+      Network.responseReceived?.(({ requestId, response, timestamp }) => {
+        const e = this.network.get(requestId);
+        if (!e) return;
+        e.status = response.status;
+        e.statusText = response.statusText;
+        e.mime = response.mimeType;
+        e.fromCache = !!response.fromDiskCache;
+        if (timestamp && e.ts) e.durationMs = Math.max(0, Math.round(timestamp * 1000) - e.ts);
+      });
+      Network.loadingFailed?.(({ requestId, errorText, canceled, blockedReason }) => {
+        const e = this.network.get(requestId);
+        if (!e) return;
+        e.failed = true;
+        e.failureText = errorText || blockedReason || (canceled ? 'canceled' : 'unknown');
+      });
+
       client.on('disconnect', () => {
         this.targets.delete(info.id);
       });
@@ -142,6 +190,28 @@ class CdpClient {
   pushLog(entry) {
     this.logs.push(entry);
     if (this.logs.length > MAX_LOGS) this.logs.splice(0, this.logs.length - MAX_LOGS);
+  }
+
+  pushNet(entry) {
+    this.network.set(entry.id, entry);
+    this.netOrder.push(entry.id);
+    if (this.netOrder.length > MAX_NET) {
+      const drop = this.netOrder.shift();
+      this.network.delete(drop);
+    }
+  }
+
+  getNetworkLogs({ grep, since, limit = 100, statusMin, statusMax, failedOnly } = {}) {
+    let out = this.netOrder.map((id) => this.network.get(id)).filter(Boolean);
+    if (since) out = out.filter((e) => e.ts >= since);
+    if (statusMin != null) out = out.filter((e) => e.status != null && e.status >= statusMin);
+    if (statusMax != null) out = out.filter((e) => e.status != null && e.status <= statusMax);
+    if (failedOnly) out = out.filter((e) => e.failed || (e.status && e.status >= 400));
+    if (grep) {
+      const re = new RegExp(grep, 'i');
+      out = out.filter((e) => re.test(e.url || ''));
+    }
+    return out.slice(-limit);
   }
 
   getLogs({ level, since, kind, limit = 200, grep } = {}) {
@@ -221,6 +291,8 @@ class CdpClient {
       capturedSinceMs: this.attachedAt ? Date.now() - this.attachedAt : null,
       totalEventsSeen: this.totalLogsSeen,
       bufferedCount: this.logs.length,
+      totalNetSeen: this.totalNetSeen,
+      bufferedNetCount: this.network.size,
       attachedTargets: this.targets.size,
       attachedContexts: contexts.length,
       contexts,
