@@ -13,19 +13,135 @@ async function runMcp() {
   const { z } = require('zod');
 
   const cdp = new CdpClient();
-  let attached = false;
+  let attachedPort = null;
 
+  // Re-attach on every tool call if the session port changed OR every attached
+  // CDP socket has dropped. This handles the common case where the user closes
+  // the Chrome test browser from the Cypress App and picks a spec again —
+  // Cypress spawns a NEW Chrome with a NEW port and the launcher updates
+  // session.json, but the MCP process is long-lived and would otherwise keep
+  // holding the dead first connection.
   async function ensureAttached() {
-    if (attached) return;
     const session = await readSession();
     if (!session?.port) {
       throw new Error('No active Cypress session. Run `cypress-inspect open` in your project first, then pick a browser + spec.');
     }
-    await cdp.attach(session.port);
-    attached = true;
+    const portChanged = attachedPort != null && session.port !== attachedPort;
+    const noTargets = attachedPort != null && cdp.listTargets().length === 0;
+    if (portChanged || noTargets) {
+      try { await cdp.detach(); } catch {}
+      attachedPort = null;
+    }
+    if (attachedPort == null) {
+      await cdp.attach(session.port);
+      attachedPort = session.port;
+      // Newly-launched Chrome may need a moment to load the spec runner
+      // page. Poll briefly (up to ~3 s) for a runner target so the very next
+      // tool call after re-attach doesn't trip over "no CDP target".
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (cdp.listTargets().some((t) => t.kind === 'runner' || t.isSpecRunner)) return;
+        await new Promise((r) => setTimeout(r, 200));
+        await cdp.refreshTargets().catch(() => {});
+      }
+      return;
+    }
+    // Same port, still have targets — but force a quick refresh so a newly-
+    // opened spec window inside the SAME Chrome process gets picked up.
+    if (noTargets === false && cdp.listTargets().length === 0) {
+      await cdp.refreshTargets();
+    }
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.8.0' });
+  // Shared restart-and-verify path used by both `rerun_spec` and
+  // `reset_and_rerun`. Snapshots reporter state, fires the restart probe,
+  // then polls the runner state for evidence of an actual restart (a test
+  // entering `running`, totals resetting, or the page reloading and tests
+  // pending). When `awaitFlag` is false we still spend a short window
+  // verifying so the caller never gets a false-positive "ok: true" when
+  // nothing happened — which was the original bug.
+  //
+  // When the default (button-click) strategy fails to take, we AUTOMATICALLY
+  // escalate to `location.reload()` rather than punting back to the caller.
+  // The agent's next call would do the same thing anyway, so saving the
+  // round-trip is a clear win. Pass `forceReload: true` from the outset to
+  // skip straight to the reload (useful if you already know in-memory state
+  // doesn't matter).
+  async function attemptOnce({ forceReload, verifyWindow, baseline }) {
+    const triggered = await cdp.evalOnRunner(probe.rerunSpecExpr({ forceReload }));
+    const deadline = Date.now() + verifyWindow;
+    let actuallyStarted = false;
+    let currentCounts = null;
+    let evidence = null;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 300));
+      const o = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
+      if (!o?.counts) continue;
+      currentCounts = o.counts;
+      if ((o.counts.running || 0) > 0) { actuallyStarted = true; evidence = 'a test entered running state'; break; }
+      if (baseline.failed > 0 && (o.counts.failed || 0) < baseline.failed) {
+        actuallyStarted = true; evidence = `failed count reset (${baseline.failed} → ${o.counts.failed})`; break;
+      }
+      if (baseline.total > 0 && (o.counts.total || 0) === 0) {
+        actuallyStarted = true; evidence = 'reporter cleared (page reload in progress)'; break;
+      }
+    }
+    return { triggered, actuallyStarted, evidence, currentCounts, verifyWindow };
+  }
+
+  async function triggerAndVerifyRerun({ awaitFlag, timeoutMs, forceReload }) {
+    const before = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
+    const baselineCounts = before?.counts || null;
+    const baseline = {
+      failed: baselineCounts?.failed ?? 0,
+      total: baselineCounts?.total ?? 0,
+    };
+    const fullWindow = awaitFlag ? timeoutMs : 3000;
+    // First attempt: honour the caller's `forceReload` flag.
+    const firstWindow = forceReload ? fullWindow : Math.min(4000, fullWindow);
+    const attempt1 = await attemptOnce({ forceReload, verifyWindow: firstWindow, baseline });
+    const attempts = [{ ...attempt1, forceReload }];
+    let final = attempt1;
+
+    // Auto-escalate to forceReload if the click strategy didn't take. Skip
+    // when the caller already asked for forceReload OR explicitly opted out
+    // of verification (awaitFlag === false → they don't want us to spend
+    // more time).
+    if (!attempt1.actuallyStarted && !forceReload && awaitFlag) {
+      const remaining = Math.max(4000, fullWindow - firstWindow);
+      const attempt2 = await attemptOnce({ forceReload: true, verifyWindow: remaining, baseline });
+      attempts.push({ ...attempt2, forceReload: true, escalated: true });
+      final = attempt2;
+    }
+
+    const totalWindow = attempts.reduce((s, a) => s + a.verifyWindow, 0);
+    const usedForceReload = forceReload || attempts.length > 1;
+    return {
+      triggered: final.triggered,
+      actuallyStarted: final.actuallyStarted,
+      evidence: final.evidence,
+      escalatedToForceReload: attempts.length > 1,
+      attempts: attempts.map((a) => ({
+        via: a.triggered?.via || null,
+        forceReload: !!a.forceReload,
+        actuallyStarted: a.actuallyStarted,
+        evidence: a.evidence,
+        verifyWindowMs: a.verifyWindow,
+      })),
+      previousCounts: baselineCounts,
+      currentCounts: final.currentCounts,
+      verifiedWithinMs: totalWindow,
+      hint: final.actuallyStarted
+        ? (usedForceReload
+          ? 'Restart confirmed via location.reload(). Call `wait_for_failure` or `get_overview` to track the new run.'
+          : 'Restart confirmed via reporter button click. Call `wait_for_failure` or `get_overview` to track the new run.')
+        : (usedForceReload
+          ? 'location.reload() was attempted but the reporter did not reset within ' + totalWindow + 'ms. The page may still be loading — call `get_overview` shortly.'
+          : 'The trigger fired but the reporter state did not change. Retry with `{ forceReload: true }` to do a hard `location.reload()`. (Auto-escalation was skipped because `await: false` was set.)'),
+    };
+  }
+
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.8.4' });
 
   // ───────────────────────────── orientation ─────────────────────────────
 
@@ -41,7 +157,20 @@ async function runMcp() {
       if (!s) return textResult('No active session. Run `cypress-inspect open` in your project.');
       try {
         await ensureAttached();
-        return textResult(JSON.stringify({ session: s, targets: cdp.listTargets(), lastError: cdp.lastError }, null, 2));
+        const targets = cdp.listTargets();
+        const out = {
+          session: s,
+          attachedPort,
+          sessionPortChanged: attachedPort !== s.port,
+          targets,
+          lastError: cdp.lastError,
+        };
+        if (targets.length === 0) {
+          out.hint = 'Attached to the CDP port but no pages are open yet. If you just closed Chrome and re-picked a spec, give the new Chrome process 2-3 s to load — then retry. The MCP will auto-rebind to the latest session port on the next call.';
+        } else if (!targets.some((t) => t.kind === 'runner' || t.isSpecRunner)) {
+          out.hint = 'CDP is attached but no spec runner page found. The user may still be on the "Choose a browser" or spec-picker screen. Pick a spec to continue.';
+        }
+        return textResult(JSON.stringify(out, null, 2));
       } catch (err) {
         return textResult(`Session file present but CDP attach failed: ${err.message}\n${JSON.stringify(s, null, 2)}`);
       }
@@ -528,37 +657,17 @@ async function runMcp() {
     'rerun_spec',
     {
       title: 'Re-run the current spec from the top',
-      description: 'Triggers a full re-run of the currently-loaded spec (same as clicking "Run all tests" in the reporter). Tries `Cypress.emit("restart")` first, falls back to `window.location.reload()`. Cypress does not expose a "rerun failed only" hook — this is a full re-run.\n\nSet `await: true` to block until the runner is actually running again (the test count resets and a test moves into `running` state, or the spec finishes a new pass). Without `await`, returns immediately with a hint telling the agent to call `wait_for_failure` / `get_overview`. Often most useful via `reset_and_rerun`.',
+      description: 'Triggers a full re-run of the currently-loaded spec.\n\nStrategy (with auto-escalation):\n  1. Click the reporter\'s restart button (leaves AUT in-memory state intact)\n  2. Try `Cypress.action("runner:restart")` / `Cypress.emit("restart")` (often a no-op in Cypress 15 but cheap)\n  3. **If steps 1-2 did not actually restart the spec, automatically falls back to `window.location.reload()`** — no second tool call required.\n\nALWAYS post-verifies via reporter state (a test enters `running`, totals reset, or the reporter clears for a page reload). Response includes `actuallyStarted`, `escalatedToForceReload`, and an `attempts: [...]` array so the agent can see exactly what happened.\n\nPass `forceReload: true` to skip straight to the reload (useful if you already know in-memory state doesn\'t matter). `await: true` (default) blocks up to `timeoutMs` (default 15 s); `await: false` skips both verification and auto-escalation.\n\nCypress does not expose a "rerun failed only" hook — this is a full re-run. Often most useful via `reset_and_rerun`.',
       inputSchema: {
         await: z.boolean().optional(),
         timeoutMs: z.number().int().positive().max(60000).optional(),
+        forceReload: z.boolean().optional(),
       },
     },
-    async ({ await: awaitFlag, timeoutMs = 15000 } = {}) => {
+    async ({ await: awaitFlag = true, timeoutMs = 15000, forceReload = false } = {}) => {
       await ensureAttached();
-      const before = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
-      const triggered = await cdp.evalOnRunner(probe.RERUN_SPEC);
-      const baseResponse = {
-        ...triggered,
-        triggered: true,
-        previousCounts: before?.counts || null,
-        hint: 'Call `get_overview` or `wait_for_failure` to observe the new run.',
-      };
-      if (!awaitFlag) return textResult(JSON.stringify(baseResponse, null, 2));
-      // Poll until totals reset (rerun started) or a test enters `running`.
-      const deadline = Date.now() + timeoutMs;
-      const baselineFailed = before?.counts?.failed ?? 0;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 500));
-        const o = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
-        if (!o?.counts) continue;
-        const running = (o.counts.running || 0) > 0;
-        const reset = (o.counts.failed || 0) < baselineFailed || (o.counts.pending || 0) > 0;
-        if (running || reset) {
-          return textResult(JSON.stringify({ ...baseResponse, started: true, currentCounts: o.counts }, null, 2));
-        }
-      }
-      return textResult(JSON.stringify({ ...baseResponse, started: false, timedOut: true, waitedMs: timeoutMs }, null, 2));
+      const result = await triggerAndVerifyRerun({ awaitFlag, timeoutMs, forceReload });
+      return textResult(JSON.stringify(result, null, 2));
     },
   );
 
@@ -566,38 +675,17 @@ async function runMcp() {
     'reset_and_rerun',
     {
       title: 'Clear app state + rerun spec (one-shot)',
-      description: 'Convenience: `clear_app_state` then `rerun_spec` with `await: true`. The realistic combined workflow when a previous run left bad state behind. Returns both reports so the agent can confirm what was cleared and that the rerun actually started.',
+      description: 'Convenience: `clear_app_state` then `rerun_spec` with verification + auto-escalation to `location.reload()` if the reporter-button click strategy doesn\'t take. The realistic combined workflow when a previous run left bad state behind. Returns `{ cleared, ...rerunResult }` including `actuallyStarted`, `escalatedToForceReload`, and an `attempts` array. Pass `forceReload: true` to skip the click-first attempt.',
       inputSchema: {
         timeoutMs: z.number().int().positive().max(60000).optional(),
+        forceReload: z.boolean().optional(),
       },
     },
-    async ({ timeoutMs = 15000 } = {}) => {
+    async ({ timeoutMs = 15000, forceReload = false } = {}) => {
       await ensureAttached();
       const cleared = await cdp.evalOnRunner(probe.CLEAR_APP_STATE);
-      const before = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
-      const triggered = await cdp.evalOnRunner(probe.RERUN_SPEC);
-      const deadline = Date.now() + timeoutMs;
-      const baselineFailed = before?.counts?.failed ?? 0;
-      let started = false;
-      let currentCounts = null;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 500));
-        const o = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
-        if (!o?.counts) continue;
-        currentCounts = o.counts;
-        if ((o.counts.running || 0) > 0 || (o.counts.failed || 0) < baselineFailed) {
-          started = true;
-          break;
-        }
-      }
-      return textResult(JSON.stringify({
-        cleared,
-        triggered,
-        started,
-        previousCounts: before?.counts || null,
-        currentCounts,
-        timedOut: !started,
-      }, null, 2));
+      const rerun = await triggerAndVerifyRerun({ awaitFlag: true, timeoutMs, forceReload });
+      return textResult(JSON.stringify({ cleared, ...rerun }, null, 2));
     },
   );
 

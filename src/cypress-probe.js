@@ -658,19 +658,64 @@ const CLEAR_APP_STATE = `(async () => {
 
 // Reload the currently-running spec — same effect as clicking the reporter's
 // "Rerun all tests" affordance. Cypress doesn't expose a "rerun failed only"
-// API, so this is the full-spec rerun. Pair with clear_app_state for a clean
-// start.
-const RERUN_SPEC = `(() => {
-  try {
-    if (window.Cypress && window.Cypress.cy) {
-      // Best path: Cypress emits "restart" on its bus to rerun the spec.
-      try { window.Cypress.emit('restart'); return { ok: true, via: 'Cypress.emit(restart)' }; } catch (e) {}
-    }
-    // Fallback — reload the spec runner page entirely.
-    window.location.reload();
-    return { ok: true, via: 'location.reload()' };
-  } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
-})()`;
+// API, so this is the full-spec rerun.
+//
+// Strategy order (cheapest first):
+//   1. Find and click the reporter's restart button. Cypress 15's reporter
+//      header has an icon button labelled "Run All Tests" / "Restart". Class
+//      names vary across point releases — match defensively on aria-label,
+//      title, button text, and class.
+//   2. Try `Cypress.action('runner:restart')` and `Cypress.emit('restart')` —
+//      these don't actually work in Cypress 15 (the runner's event manager
+//      is not `window.Cypress`), but they're cheap and harmless to try.
+//   3. If `forceReload`, do `window.location.reload()`.
+//
+// Returns `{ ok, via, ... }`. The MCP tool wraps this in a verification loop
+// that checks the reporter state actually changed, so a `ok: true` that
+// didn't actually do anything is caught on the server side.
+function rerunSpecExpr({ forceReload = false } = {}) {
+  return `(() => {
+    try {
+      if (${forceReload}) {
+        window.location.reload();
+        return { ok: true, via: 'location.reload (forced)' };
+      }
+      // 1. Click the reporter's restart button.
+      const candidates = [...document.querySelectorAll('button, [role="button"], [class*="restart"], [class*="rerun"], [class*="run-all"]')];
+      const restartBtn = candidates.find((b) => {
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        const title = (b.getAttribute('title') || '').toLowerCase();
+        const text = ((b.innerText || b.textContent) || '').toLowerCase();
+        const cls = (b.className || '').toString().toLowerCase();
+        const haystack = aria + ' ' + title + ' ' + text;
+        if (/restart|rerun|run all tests|re-run/.test(haystack)) return true;
+        if (/restart|rerun/.test(cls)) return true;
+        return false;
+      });
+      if (restartBtn) {
+        restartBtn.scrollIntoView({ block: 'center' });
+        ['mouseover','mousedown','mouseup','click'].forEach(t =>
+          restartBtn.dispatchEvent(new MouseEvent(t, { bubbles: true }))
+        );
+        const label = restartBtn.getAttribute('aria-label')
+          || restartBtn.getAttribute('title')
+          || (restartBtn.innerText || '').trim().slice(0, 40)
+          || (restartBtn.className || '').toString().slice(0, 60);
+        return { ok: true, via: 'click: ' + label };
+      }
+      // 2. Cypress event APIs (often a no-op in current versions but cheap).
+      if (window.Cypress) {
+        try { window.Cypress.action && window.Cypress.action('runner:restart'); } catch (e) {}
+        try { window.Cypress.emit && window.Cypress.emit('restart'); } catch (e) {}
+        // We can't tell if these did anything — the wrapping MCP tool verifies.
+        return { ok: true, via: 'Cypress.action/emit (unverified)', warning: 'No restart button found in reporter DOM; the Cypress event APIs may or may not be wired up. The tool will verify via reporter state.' };
+      }
+      return { ok: false, via: null, hint: 'No restart button found and window.Cypress unavailable. Retry with { forceReload: true } for a hard page reload.' };
+    } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+  })()`;
+}
+
+const RERUN_SPEC = rerunSpecExpr();
 
 // Open an IndexedDB database in the AUT iframe and either list its object
 // stores OR dump records from one store. Designed for the PouchDB / offline-
@@ -755,6 +800,7 @@ module.exports = {
   commandsPagedForTestExpr,
   commandsAroundExpr,
   getIndexedDbExpr,
+  rerunSpecExpr,
   stepToExpr,
   autDomExpr,
   findTestExpr,

@@ -19,18 +19,27 @@ class CdpClient {
   }
 
   async attach(port) {
+    // Idempotent: if we're already attached (possibly to a stale port) tear
+    // it down first so a re-attach to a freshly-launched Chrome process is a
+    // single call from the caller's perspective.
+    if (this.refreshTimer || this.targets.size) await this.detach();
     this.port = port;
     this.attachedAt = Date.now();
+    this.lastError = null;
     await this.refreshTargets();
     this.refreshTimer = setInterval(() => this.refreshTargets().catch(() => {}), 2000);
   }
 
   async detach() {
-    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.refreshTimer) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
     for (const [, t] of this.targets) {
       try { await t.client.close(); } catch {}
     }
     this.targets.clear();
+    this.port = null;
+    // Preserve the log / network buffers across re-attach — those are the
+    // agent's history and dropping them would be surprising. attachedAt is
+    // updated on the next attach() call.
   }
 
   classify(info) {

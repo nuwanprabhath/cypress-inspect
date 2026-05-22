@@ -176,7 +176,7 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 
 2. In your agent, ask it to investigate. A good starter prompt:
 
-   > "A Cypress test failed. Use cypress-inspect to debug it. Start with `get_overview`, then `get_failures` for the full list, then `step_to` and `get_dom` to inspect the state at the failing command."
+   > "A Cypress test failed. Use cypress-inspect MCP to debug it and fix it."
 
 ## Tools (v0.8.1)
 
@@ -224,8 +224,8 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 | `get_storage` | Snapshot of localStorage, sessionStorage, cookies, and IndexedDB database **names** from the AUT iframe. Each value clipped to 1 KB. Use to diagnose stale-state flakes (cached auth, partially-synced PouchDB databases). For object-store contents see `get_indexeddb`. |
 | `get_indexeddb` `{ dbName, store?, limit?, valueMaxBytes? }` | Open an IndexedDB database and either list its object stores (omit `store`) or dump records from one store (default 25, max 500). Values are JSON-stringified and clipped to `valueMaxBytes` (default 2 KB). Designed for PouchDB / offline-queue debugging without writing eval payloads. |
 | `clear_app_state` | **Write operation.** Clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database in the AUT. Returns counts of what was cleared. |
-| `rerun_spec` `{ await?, timeoutMs? }` | Re-run the current spec from the top. Tries `Cypress.emit("restart")`, falls back to `location.reload()`. Returns `{ triggered: true, hint, previousCounts }`; `await: true` blocks until the runner actually starts (or `timedOut`). |
-| `reset_and_rerun` `{ timeoutMs? }` | One-shot: `clear_app_state` followed by `rerun_spec { await: true }`. Returns both reports so the agent can confirm what was cleared and that the rerun started. |
+| `rerun_spec` `{ await?, timeoutMs?, forceReload? }` | Re-run the current spec from the top. Tries clicking the reporter's "Rerun all tests" button first; if that doesn't actually restart, **auto-escalates to `location.reload()`** within the same call — no second round-trip. Pass `forceReload: true` to skip straight to the reload. Returns `{ actuallyStarted, escalatedToForceReload, attempts: [...] }` so the agent sees exactly what happened. |
+| `reset_and_rerun` `{ timeoutMs?, forceReload? }` | `clear_app_state` then `rerun_spec` with the same auto-escalation. Returns both reports. |
 | `wait_for_failure` `{ baseline?, timeoutMs?, pollMs? }` | Block until the failure count grows past `baseline` (or current count) and return the new failure. Lets a watch-mode agent react to the next failure without the user nudging it. Timeout default 60 s, max 120 s. |
 
 ### Docs & static analysis
@@ -260,6 +260,7 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 - **Console buffer is in-memory, capped at 5,000 entries**. Logs from before the MCP server attached are not captured. Best practice: start the MCP server, then run the failing spec.
 - **Network buffer is in-memory, capped at 2,000 entries**. Same "since attach" caveat — `get_network_logs` will warn when the buffer is empty so the agent doesn't blame its filter.
 - **Cypress garbage-collects test panels after a spec completes.** `get_test_commands*` returns empty for finished specs; trigger `rerun_spec` (or `reset_and_rerun`) to repopulate.
+- **Re-launching Chrome** (close → re-pick spec in the Cypress App) is handled automatically: the launcher writes the new CDP port to `~/.cypress-inspect/session.json` and the MCP server re-attaches on the next tool call. If the very next tool returns "no CDP target", give the new Chrome 1-2 s and retry — the auto-rebind needs the new spec runner page to load.
 - **No write tools.** The plugin is read-only by design — it scrapes/clicks the runner UI, never modifies your project files or Cypress config.
 
 ## Inspirations
