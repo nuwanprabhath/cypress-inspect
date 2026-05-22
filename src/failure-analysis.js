@@ -1,3 +1,5 @@
+const { docsHintsForFailure } = require('./cypress-docs');
+
 // Post-processors for the raw `failures` payload returned by cypress-probe.
 
 // Parse Cypress-style "Compare" assertion errors (e.g. "InProgress Summary
@@ -132,7 +134,10 @@ function augmentFailures(payload, { dedupe = false, logs = null, reporterWarning
   if (!payload || !Array.isArray(payload.failures)) return payload;
   let failures = payload.failures.map((f) => {
     const parsed = parseCompareError(f.message);
-    return parsed ? { ...f, parsedDiff: parsed } : f;
+    const next = parsed ? { ...f, parsedDiff: parsed } : { ...f };
+    const hints = docsHintsForFailure(next);
+    if (hints.length) next.cypressDocsHints = hints;
+    return next;
   });
   failures = annotateCascades(failures);
 

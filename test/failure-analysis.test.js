@@ -196,6 +196,20 @@ test('augmentFailures: console + reporter signals merge by id with both sources 
   assert.deepEqual(out.flakeSignals[0].sources.sort(), ['console', 'reporter']);
 });
 
+test('augmentFailures: attaches cypressDocsHints when message mentions cy.<command>', () => {
+  const out = augmentFailures({
+    failures: [
+      { index: 0, message: 'Timed out retrying after 4000ms: expected cy.get() to find element', stack: 'at cy.intercept (x:1)' },
+      { index: 1, message: 'unrelated error', stack: '' },
+    ],
+  });
+  const hints = out.failures[0].cypressDocsHints;
+  assert.ok(Array.isArray(hints));
+  const cmds = hints.map((h) => h.command).sort();
+  assert.deepEqual(cmds, ['cy.get', 'cy.intercept']);
+  assert.equal(out.failures[1].cypressDocsHints, undefined);
+});
+
 test('augmentFailures dedupe: surfaces rootCauses[] and flakeSignals top-level', () => {
   const out = augmentFailures(
     {

@@ -6,6 +6,66 @@ Gives the agent the same toolkit a human uses when staring at a failing `cypress
 
 It works by attaching to Cypress's test browser via the Chrome DevTools Protocol. **No changes to your project's Cypress config are required.**
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  AI Agent  (Claude Code · VS Code Copilot · any MCP client)     │
+│                                                                 │
+│   "get_failures"  "step_to"  "get_dom"  "screenshot"  …         │
+└────────────────────────┬────────────────────────────────────────┘
+                         │  MCP  (stdio JSON-RPC)
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  cypress-inspect MCP server  (Node.js)                          │
+│                                                                 │
+│  • Reads ~/.cypress-inspect/session.json for the CDP port       │
+│  • Maintains a live CDP WebSocket connection to Chrome          │
+│  • Buffers Runtime.consoleAPICalled events (up to 5 000)        │
+│  • Translates MCP tool calls → CDP commands / DOM queries       │
+└──────────┬──────────────────────────────────┬───────────────────┘
+           │ writes port on start             │ Chrome DevTools Protocol
+           │                                  │ (WebSocket)
+┌──────────▼────────────┐          ┌──────────▼───────────────────┐
+│  cypress-inspect open │          │  Chrome  (Cypress test       │
+│  (wraps cypress open) │          │  browser,--remote-debugging) │
+│                       │  spawns  │                              │
+│  Sets DEBUG=          ├─────────►│ ┌───────────────────────────┐│
+│  cypress:server:      │          │ │   Spec Runner page        ││
+│  browsers*            │          │ │   (window.Cypress lives   ││
+│                       │          │ │    here)                  ││
+│  Scrapes CDP port     │          │ │                           ││
+│  from debug stdout    │          │ │  ┌────────────────────┐   ││
+│  (ignores Electron's  │          │ │  │  Reporter DOM      │   ││
+│   own port)           │          │ │  │  .test             │   ││
+└───────────────────────┘          │ │  │  .command-wrapper  │   ││
+                                   │ │  │  .runnable-err-*   │   ││
+┌──────────────────────┐           │ │  └────────────────────┘   ││
+│  Cypress Electron App│           │ │                           ││
+│  (launchpad / project│           │ │  ┌────────────────────┐   ││
+│   picker)            │           │ │  │  AUT iframe        │   ││
+│                      │           │ │  │  (app under test)  │   ││
+│  cypress-inspect     │           │ │  │  same-origin →     │   ││
+│  ignores this port   │           │ │  │  no separate CDP   │   ││
+└──────────────────────┘           │ │  │  target            │   ││
+                                   │ │  └────────────────────┘   ││
+                                   │ └───────────────────────────┘│
+                                   └──────────────────────────────┘
+```
+
+### Where each data type comes from
+
+| Tool / data | Source |
+|---|---|
+| Console logs (`get_console_logs`) | CDP `Runtime.consoleAPICalled` events, buffered as they arrive |
+| Reporter warnings (`flakeSignals`) | Reporter DOM scrape — Cypress wraps `console.*` in the AUT iframe so those calls never reach CDP; the reporter command-log rows are the canonical source |
+| Screenshots (`screenshot`) | CDP `Page.captureScreenshot` on the spec-runner page, with optional crop to the AUT iframe rect |
+| DOM snapshot (`get_dom`, `find_in_aut`) | `Runtime.evaluate` on the runner page → reads `iframe.aut-iframe.contentDocument` |
+| Test results & failures (`get_overview`, `get_failures`) | `Runtime.evaluate` walks the reporter DOM (`.test.runnable-failed`, `.runnable-err-message`, etc.) |
+| Command log & time-travel (`get_test_commands`, `step_to`) | `Runtime.evaluate` reads `.command-wrapper` rows; `step_to` simulates a click on the target row to pin the AUT snapshot |
+| Live test state (`get_live_commands`) | `Runtime.evaluate` → `window.Cypress.cy.queue` |
+| AUT page info (`get_aut_info`) | `Runtime.evaluate` → `iframe.aut-iframe.contentWindow.location`, `document.title`, `readyState` |
+
 ## How it works
 
 `cypress-inspect open` wraps `cypress open`, turns on Cypress's internal browser debug logging, and scrapes the test-browser's CDP port out of stdout. The port + project cwd are written to `~/.cypress-inspect/session.json`.
@@ -93,14 +153,14 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 
    > "A Cypress test failed. Use cypress-inspect to debug it. Start with `get_overview`, then `get_failures` for the full list, then `step_to` and `get_dom` to inspect the state at the failing command."
 
-## Tools (v0.6)
+## Tools (v0.7)
 
 ### Orientation
 | Tool | Use |
 | --- | --- |
 | `status` | Session info + attached CDP targets. Always call if something returns "no Cypress". |
 | `get_overview` | **Start here.** Spec file, pass/fail/pending counts, first failure (title + suite + error + stack + code frame), live test if any. |
-| `get_failures` `{ dedupe? }` | All failed tests with error/stack/code-frame. Auto-tags `rootCause: true` on the first failure + `looksLikeCascade` / `cascadeOf` on downstream ones. Each failure also includes `relatedCommandIndex` / `relatedCommandNumber` pointing at the failed command in the reporter so the agent can `step_to` directly. Compare-style errors are parsed into `parsedDiff.diffs: [{ path, pathSegments, expected, actual }]`. Top-level `flakeSignals` is populated from TWO sources merged by id: the CDP console buffer **and** the reporter command-log (`/WARNING:/i` rows) — important because Cypress wraps `console.*` in the AUT iframe so the CDP buffer often misses warnings. Matching IDs also attach to the root failure. `dedupe: true` adds `rootCauses: [<index>]` and splits cascading failures into a separate array. |
+| `get_failures` `{ dedupe? }` | All failed tests with error/stack/code-frame. Auto-tags `rootCause: true` on the first failure + `looksLikeCascade` / `cascadeOf` on downstream ones. Each failure also includes `relatedCommandIndex` / `relatedCommandNumber` pointing at the failed command in the reporter so the agent can `step_to` directly, and `cypressDocsHints: [{ command, url }]` linking every `cy.<command>` mentioned in the error to its docs page. Compare-style errors are parsed into `parsedDiff.diffs: [{ path, pathSegments, expected, actual }]`. Top-level `flakeSignals` is populated from TWO sources merged by id: the CDP console buffer **and** the reporter command-log (`/WARNING:/i` rows) — important because Cypress wraps `console.*` in the AUT iframe so the CDP buffer often misses warnings. Matching IDs also attach to the root failure. `dedupe: true` adds `rootCauses: [<index>]` and splits cascading failures into a separate array. |
 | `parse_compare_error` `{ message }` | Standalone parser for "Compare - FAILURES" / "InProgress Summary Widget comparison failed" strings. Returns `{ summary: { failed, total }, diffs: [...] }`. |
 | `list_tests` | Lightweight list of every test with state + title + suite ancestry. Use returned `index` with the next two tools. |
 | `find_test` `{ query }` | Partial-title search across tests. Returns matches with index + state. Faster than scanning `list_tests`. |
@@ -123,6 +183,12 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 | `get_dom` `{ selector?, maxBytes? }` | Rendered HTML of the AUT iframe at the currently-pinned snapshot. |
 | `find_in_aut` `{ selector, limit?, textOnly? }` | Run a CSS selector against the AUT. Default: compact JSON per match (tag, attrs, text, textTruncated, textLength, value, visible, disabled). `textOnly: true` returns just the **full untruncated text** of each match — best for summary widgets or anything where you only care what the user reads. |
 | `get_aut_info` | AUT iframe src + location (href/pathname/hash/search) + document.title + readyState + navigator.onLine. Also returns a `capture` block with attached targets, execution contexts (with origin / aux frame data), and total events seen — useful for diagnosing why a console.* call might not be reaching the buffer. |
+
+### Docs & static analysis
+| Tool | Use |
+| --- | --- |
+| `cypress_docs` `{ topic }` | Fetch the canonical Cypress doc page for a command or topic from `docs.cypress.io`, preferring the LLM-friendly markdown mirror under `/llm/markdown/...`. Topics: `cy.intercept`, `intercept`, `session`, `retries`, `best-practices`, `selectors`, etc. Use **before** asserting "Cypress can / cannot X" — the docs are the source of truth, not training data. |
+| `analyze_spec` `{ path? \| source?, maxTestLines? }` | Static lint of a Cypress spec against the [cypress-io/ai-toolkit](https://github.com/cypress-io/ai-toolkit) explain-test rules: brittle selectors (no `data-cy`), `cy.wait(<number>)` literals, missing assertions, `await cy.*` (Cypress chains aren't real Promises), `null` dropdown args (random-selection flake), `.only`/`.skip` left in, UI-only login setup without `cy.session`/`cy.request`, overlong tests. Returns `{ smells, summary, tests }` — pair with `get_failures` to correlate static smells with runtime failures. |
 
 ### Escape hatch
 | Tool | Use |

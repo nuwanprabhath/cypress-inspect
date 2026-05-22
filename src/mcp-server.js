@@ -4,6 +4,8 @@ const { readSession } = require('./session');
 const { CdpClient } = require('./cdp-client');
 const probe = require('./cypress-probe');
 const { augmentFailures, parseCompareError } = require('./failure-analysis');
+const { fetchCypressDoc, resolveDocPath } = require('./cypress-docs');
+const { analyzeSpec } = require('./spec-analysis');
 
 async function runMcp() {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -23,7 +25,7 @@ async function runMcp() {
     attached = true;
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.6.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.7.0' });
 
   // ───────────────────────────── orientation ─────────────────────────────
 
@@ -367,6 +369,54 @@ async function runMcp() {
           contexts: status.contexts,
         },
       }, null, 2));
+    },
+  );
+
+  // ───────────────────────────── docs / static analysis ─────────────────────
+
+  server.registerTool(
+    'cypress_docs',
+    {
+      title: 'Look up official Cypress documentation',
+      description: 'Fetch the canonical Cypress docs page for a command or topic from docs.cypress.io. Uses the LLM-friendly markdown mirror under /llm/markdown when available, falling back to a docs URL otherwise. Pass a `topic` like "cy.intercept", "intercept", "session", "retries", "best-practices", "selectors". Use this BEFORE asserting that "Cypress can / cannot X" — the docs are the source of truth, not your training data. The response includes a `url` you can cite to the user.',
+      inputSchema: { topic: z.string() },
+    },
+    async ({ topic }) => {
+      const result = await fetchCypressDoc(topic);
+      if (result.error && !result.markdown) {
+        const candidates = resolveDocPath(topic);
+        return textResult(
+          `${result.error}\nCandidate URLs:\n${candidates.map((c) => `  - [${c.kind}] ${c.url}`).join('\n')}`,
+        );
+      }
+      const header = `# ${result.kind === 'guide' ? 'Guide' : 'Command'}: ${topic}\nSource: ${result.url}\n---\n`;
+      return textResult(header + result.markdown);
+    },
+  );
+
+  server.registerTool(
+    'analyze_spec',
+    {
+      title: 'Static analysis of a Cypress spec for flake smells',
+      description: 'Lint a Cypress spec file against the Cypress AI Toolkit explain-test rules. Detects:\n  • brittle-selector — cy.get/find with bare tag / single class / :nth-child / id (no data-cy)\n  • hardcoded-wait — cy.wait(<number>) literals\n  • missing-assertion — it() body with no .should / .and / expect / cy.contains / assert\n  • await-on-cypress — `await cy.*` (Cypress chains are not real Promises)\n  • null-helper-arg — selectFromDropdown(..., null) and similar (often triggers random selection → flake)\n  • focused-test / skipped-test — .only / .skip left in\n  • ui-only-setup — many clicks/types before first assertion with no cy.session / cy.request\n  • overlong-test — single it() longer than `maxTestLines` (default 80)\n\nPass `source` directly OR `path` (resolved relative to the active project from cypress-inspect open). Returns `{ smells: [...], summary: {<rule>: count}, tests: [...] }`.',
+      inputSchema: {
+        path: z.string().optional(),
+        source: z.string().optional(),
+        maxTestLines: z.number().int().positive().max(2000).optional(),
+      },
+    },
+    async ({ path: p, source, maxTestLines } = {}) => {
+      let text = source;
+      let resolvedPath = null;
+      if (!text) {
+        if (!p) return textResult('Pass either `source` (the spec text) or `path` (file to read).');
+        const s = await readSession();
+        resolvedPath = path.isAbsolute(p) ? p : path.resolve(s?.cwd || process.cwd(), p);
+        if (!fs.existsSync(resolvedPath)) return textResult(`No such file: ${resolvedPath}`);
+        text = fs.readFileSync(resolvedPath, 'utf8');
+      }
+      const result = analyzeSpec(text, { path: resolvedPath || p || null, maxTestLines });
+      return textResult(JSON.stringify(result, null, 2));
     },
   );
 
