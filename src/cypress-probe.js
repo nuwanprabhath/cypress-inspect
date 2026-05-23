@@ -184,17 +184,25 @@ function commandsForTestExpr(testIndex, { full = false, argMaxBytes = 240, textM
 }
 
 // Live queue from Cypress.cy.queue — only meaningful for the in-flight test.
+// Function-valued args (coverage callbacks, .then handlers, etc.) are
+// reduced to a one-line summary — the source body is rarely useful and can
+// dominate the payload (~40 KB for one coverage plugin).
 const LIVE_COMMANDS = `(() => {
   try {
     const C = window.Cypress;
     if (!C || !C.cy) return { error: 'No active Cypress.cy on runner' };
     const queue = (C.cy.queue && (C.cy.queue.get ? C.cy.queue.get() : C.cy.queue)) || [];
+    const summarize = (x) => {
+      if (typeof x === 'function') return '[Function: ' + (x.name || 'anonymous') + ']';
+      if (typeof x === 'string') return x.slice(0, 240);
+      try {
+        const s = JSON.stringify(x, (k, v) => typeof v === 'function' ? '[Function: ' + (v.name || 'anonymous') + ']' : v);
+        return s == null ? String(x).slice(0, 240) : s.slice(0, 240);
+      } catch { return String(x).slice(0, 240); }
+    };
     return queue.map((c, i) => {
       const a = c.attributes || c;
-      const args = (a.args || []).map(x => {
-        try { return typeof x === 'string' ? x.slice(0, 240) : JSON.stringify(x).slice(0, 240); }
-        catch { return String(x); }
-      });
+      const args = (a.args || []).map(summarize);
       return { index: i, name: a.name, args, state: a.state, type: a.type };
     });
   } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
@@ -618,31 +626,41 @@ const STORAGE_SNAPSHOT = `(async () => {
 })()`;
 
 // Clear browser state for the AUT iframe. Best-effort: clears localStorage,
-// sessionStorage, cookies (path=/ on current host), and deletes every named
-// IndexedDB database. Returns the names of what was cleared.
-const CLEAR_APP_STATE = `(async () => {
-  const report = { localStorage: 0, sessionStorage: 0, cookies: 0, databasesDeleted: [], errors: [] };
-  try {
-    const aut = document.querySelector('iframe.aut-iframe');
-    if (!aut || !aut.contentWindow) return { error: 'AUT iframe not found' };
-    const w = aut.contentWindow;
-    const d = aut.contentDocument;
-    try { report.localStorage = w.localStorage.length; w.localStorage.clear(); } catch (e) { report.errors.push('localStorage: ' + e.message); }
-    try { report.sessionStorage = w.sessionStorage.length; w.sessionStorage.clear(); } catch (e) { report.errors.push('sessionStorage: ' + e.message); }
+// sessionStorage, cookies (path=/ on current host), and deletes IndexedDB
+// databases (with optional skip list). Returns the names of what was cleared
+// AND what was skipped.
+function clearAppStateExpr({ skipDatabases = [], skipLocalStorage = false, skipSessionStorage = false, skipCookies = false } = {}) {
+  return `(async () => {
+    const skipDb = new Set(${JSON.stringify(skipDatabases)});
+    const report = { localStorage: 0, sessionStorage: 0, cookies: 0, databasesDeleted: [], databasesSkipped: [], errors: [] };
     try {
-      const cookies = (d.cookie || '').split(';');
-      report.cookies = cookies.filter(Boolean).length;
-      for (const c of cookies) {
-        const name = c.split('=')[0].trim();
-        if (!name) continue;
-        d.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/;';
+      const aut = document.querySelector('iframe.aut-iframe');
+      if (!aut || !aut.contentWindow) return { error: 'AUT iframe not found' };
+      const w = aut.contentWindow;
+      const d = aut.contentDocument;
+      if (!${skipLocalStorage}) {
+        try { report.localStorage = w.localStorage.length; w.localStorage.clear(); } catch (e) { report.errors.push('localStorage: ' + e.message); }
       }
-    } catch (e) { report.errors.push('cookies: ' + e.message); }
-    try {
-      if (w.indexedDB && typeof w.indexedDB.databases === 'function') {
-        const dbs = await w.indexedDB.databases();
-        for (const db of dbs) {
-          if (db.name) {
+      if (!${skipSessionStorage}) {
+        try { report.sessionStorage = w.sessionStorage.length; w.sessionStorage.clear(); } catch (e) { report.errors.push('sessionStorage: ' + e.message); }
+      }
+      if (!${skipCookies}) {
+        try {
+          const cookies = (d.cookie || '').split(';');
+          report.cookies = cookies.filter(Boolean).length;
+          for (const c of cookies) {
+            const name = c.split('=')[0].trim();
+            if (!name) continue;
+            d.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/;';
+          }
+        } catch (e) { report.errors.push('cookies: ' + e.message); }
+      }
+      try {
+        if (w.indexedDB && typeof w.indexedDB.databases === 'function') {
+          const dbs = await w.indexedDB.databases();
+          for (const db of dbs) {
+            if (!db.name) continue;
+            if (skipDb.has(db.name)) { report.databasesSkipped.push(db.name); continue; }
             await new Promise((resolve) => {
               const req = w.indexedDB.deleteDatabase(db.name);
               req.onsuccess = req.onerror = req.onblocked = () => resolve();
@@ -650,11 +668,14 @@ const CLEAR_APP_STATE = `(async () => {
             report.databasesDeleted.push(db.name);
           }
         }
-      }
-    } catch (e) { report.errors.push('indexedDB: ' + e.message); }
-    return report;
-  } catch (e) { return { error: String(e && e.stack || e && e.message || e), report }; }
-})()`;
+      } catch (e) { report.errors.push('indexedDB: ' + e.message); }
+      return report;
+    } catch (e) { return { error: String(e && e.stack || e && e.message || e), report }; }
+  })()`;
+}
+
+// Back-compat: callers using the constant still get the no-args behaviour.
+const CLEAR_APP_STATE = clearAppStateExpr();
 
 // Reload the currently-running spec — same effect as clicking the reporter's
 // "Rerun all tests" affordance. Cypress doesn't expose a "rerun failed only"
@@ -801,6 +822,7 @@ module.exports = {
   commandsAroundExpr,
   getIndexedDbExpr,
   rerunSpecExpr,
+  clearAppStateExpr,
   stepToExpr,
   autDomExpr,
   findTestExpr,

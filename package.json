@@ -1,6 +1,6 @@
 {
   "name": "cypress-inspect",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "description": "MCP server + CDP attach for debugging Cypress test failures from Claude / VS Code / any MCP-capable agent.",
   "bin": {
     "cypress-inspect": "bin/cypress-inspect.js"

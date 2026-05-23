@@ -247,7 +247,27 @@ class CdpClient {
     return all.find((t) => t.info.type === 'page') || all[0];
   }
 
-  async evalOnRunner(expression, { awaitPromise = true, returnByValue = true } = {}) {
+  async evalOnRunner(expression, opts = {}) {
+    try {
+      return await this._evalOnceOnRunner(expression, opts);
+    } catch (err) {
+      // Auto-reconnect on transient CDP socket failures. The underlying
+      // WebSocket can drop mid-spec (Chrome navigates, the launchpad opens a
+      // new tab, Chrome briefly hangs). chrome-remote-interface emits the
+      // 'disconnect' event eventually, but a concurrent call in flight throws
+      // first with one of these signatures.
+      const msg = String((err && err.message) || err);
+      const recoverable = /ECONNREFUSED|WebSocket is not open|not connected|connection closed|connection lost|socket hang up|disconnected|EPIPE/i.test(msg);
+      if (!recoverable) throw err;
+      // Drop any stale targets and rebuild from the CDP /json list.
+      try { await this.refreshTargets(); } catch {}
+      // If refreshTargets didn't find a runner the second try will fail with
+      // a clear "No CDP target available" rather than the cryptic socket error.
+      return await this._evalOnceOnRunner(expression, opts);
+    }
+  }
+
+  async _evalOnceOnRunner(expression, { awaitPromise = true, returnByValue = true } = {}) {
     const target = this.pickRunnerTarget();
     if (!target) throw new Error('No CDP target available (is `cypress-inspect open` running and a spec selected?)');
     const { Runtime } = target.client;

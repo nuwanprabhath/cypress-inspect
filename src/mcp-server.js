@@ -141,7 +141,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.8.4' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.9.0' });
 
   // ───────────────────────────── orientation ─────────────────────────────
 
@@ -266,7 +266,7 @@ async function runMcp() {
     'get_test_commands',
     {
       title: 'Get commands logged for a specific test',
-      description: 'Returns the rendered command list for the test at `index` (use `list_tests` to find it). Each entry has `number` (reporter-displayed number, NOT unique across rows — Cypress renders one logical command as 2-3 wrapper rows for parent+children), `index` (raw DOM position, unique), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength` so you can tell when content was cut. Set `full: true` to return untruncated args + text (heavier payload — use when the error message is buried in a log row\'s arg). The result also includes `numberToIndex` mapping for quickly resolving a displayed reporter number to the first DOM index, useful with `step_to { commandNumber }`.\n\nFinished-spec caveat: Cypress garbage-collects test panels after a spec completes, so an empty `commands: []` typically means the spec is no longer live. Call mid-run, or trigger `rerun_spec` first. (For complex specs prefer `get_test_commands_summary` / `get_test_commands_page` to avoid truncation.)',
+      description: '⚠ **For most cases prefer `get_test_commands_summary` first** — for complex tests this tool can return 50+ KB which overflows the agent\'s per-tool-result budget. Use `get_test_commands_summary` to triage, then `get_test_commands_page` for a specific window.\n\nReturns the rendered command list for the test at `index` (use `list_tests` to find it). Each entry has `number` (reporter-displayed number, NOT unique across rows — Cypress renders one logical command as 2-3 wrapper rows for parent+children), `index` (raw DOM position, unique), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength` so you can tell when content was cut. Set `full: true` to return untruncated args + text (heavier payload — use when the error message is buried in a log row\'s arg). The result also includes `numberToIndex` mapping for quickly resolving a displayed reporter number to the first DOM index, useful with `step_to { commandNumber }`.\n\nFinished-spec caveat: Cypress garbage-collects test panels after a spec completes, so an empty `commands: []` typically means the spec is no longer live. Call mid-run, or trigger `rerun_spec` first.',
       inputSchema: {
         index: z.number().int().nonnegative(),
         full: z.boolean().optional(),
@@ -346,7 +346,7 @@ async function runMcp() {
     'get_failure_context',
     {
       title: 'Commands before / after the failing command',
-      description: 'Returns the N commands BEFORE and M AFTER the failing command in a given failed test (default 5 / 5). Resolves the anchor from either `failureIndex` (a test\'s reporter index — finds the failed command in it) or an explicit `{ testIndex, commandIndex }`. The most common follow-up to `get_failures` — skips manual slicing.\n\n`mode` controls what `before`/`after` count:\n  • `"logical"` (default) — UNIQUE displayed command numbers. 5/5 ≈ 5 logical cy.* calls on each side. Matches what a human sees in the reporter.\n  • `"wrappers"` — raw DOM rows. Cypress emits 2-3 wrappers per command (parent + retries), so 5/5 can return up to ~33 rows. Use only if you need exact wrapper-row diagnostics.',
+      description: 'Returns the N commands BEFORE and M AFTER the failing command in a given failed test (default 5 / 5). The most common follow-up to `get_failures` — skips manual slicing.\n\n**Resolving WHICH failure**:\n  • `failureIndex` — position in the `get_failures` array (0 = first failure). This is the natural way: `get_failures` returns `failures[0]`, then `get_failure_context({ failureIndex: 0 })`. If that doesn\'t match, it falls back to treating it as a test reporter index (the `.index` field on each failure).\n  • `testIndex` + optional `commandIndex` — explicit. Use when you already know exactly which test/command you want.\n\n`mode` controls what `before`/`after` count:\n  • `"logical"` (default) — UNIQUE displayed command numbers. 5/5 ≈ 5 logical cy.* calls on each side. Matches what a human sees in the reporter.\n  • `"wrappers"` — raw DOM rows. Cypress emits 2-3 wrappers per command (parent + retries), so 5/5 can return up to ~33 rows. Use only if you need exact wrapper-row diagnostics.',
       inputSchema: {
         failureIndex: z.number().int().nonnegative().optional(),
         testIndex: z.number().int().nonnegative().optional(),
@@ -360,16 +360,36 @@ async function runMcp() {
       await ensureAttached();
       let tIdx = testIndex;
       let anchor = commandIndex;
-      if (tIdx == null && failureIndex != null) tIdx = failureIndex;
-      if (tIdx == null) return textResult('Pass either failureIndex or testIndex.');
+      let resolvedFailure = null;
+      if (failureIndex != null && tIdx == null) {
+        const failures = await cdp.evalOnRunner(probe.FAILURES);
+        const list = failures?.failures || [];
+        // Try array-position semantics first (the natural way after get_failures)
+        if (failureIndex < list.length) {
+          resolvedFailure = list[failureIndex];
+        } else {
+          // Fall back to treating failureIndex as a test reporter index.
+          resolvedFailure = list.find((x) => x.index === failureIndex);
+        }
+        if (!resolvedFailure) {
+          return textResult(`No failure found for failureIndex=${failureIndex}. Got ${list.length} failures with reporter indices: [${list.map((f) => f.index).join(', ')}]`);
+        }
+        tIdx = resolvedFailure.index;
+        if (anchor == null) anchor = resolvedFailure.relatedCommandIndex;
+      }
+      if (tIdx == null) return textResult('Pass either failureIndex (position in get_failures) or testIndex.');
       if (anchor == null) {
         const failures = await cdp.evalOnRunner(probe.FAILURES);
         const f = (failures?.failures || []).find((x) => x.index === tIdx);
-        if (!f) return textResult(`No failed test at index ${tIdx}`);
+        if (!f) return textResult(`No failed test at reporter index ${tIdx}`);
         anchor = f.relatedCommandIndex;
         if (anchor == null) return textResult(`No failed command found in test ${tIdx}.`);
       }
       const result = await cdp.evalOnRunner(probe.commandsAroundExpr(tIdx, anchor, before, after, { mode }));
+      if (resolvedFailure) {
+        result._resolvedFromFailureIndex = failureIndex;
+        result._resolvedTestIndex = tIdx;
+      }
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -406,19 +426,35 @@ async function runMcp() {
     'step_to',
     {
       title: 'Time-travel: pin to a command in a specific test',
-      description: 'Restore the AUT to the state at one command (same as clicking in the Cypress sidebar). Expands the test panel first if collapsed. Specify the command by EITHER `commandNumber` (the displayed reporter number, e.g. 38 — preferred; matches what humans see) OR `commandIndex` (raw DOM position 0..N — useful when there are duplicate numbers because Cypress renders parents + children as separate rows). If both are given, `commandNumber` wins. After this, `get_dom` / `screenshot { kind: "aut" }` / `get_pinned_command` reflect the pinned step.',
+      description: 'Restore the AUT to the state at one command (same as clicking in the Cypress sidebar). Expands the test panel first if collapsed. Three ways to specify the target:\n  • `failureIndex` — position in the `get_failures` array. Auto-resolves to the test\'s failing command. Shortest path from `get_failures` to a pinned snapshot.\n  • `testIndex` + `commandNumber` — the displayed reporter number (e.g. 38). Matches what humans see.\n  • `testIndex` + `commandIndex` — raw DOM position 0..N. Use to disambiguate duplicate reporter numbers (Cypress renders parent + child rows separately).\nIf both `commandNumber` and `commandIndex` are given, `commandNumber` wins. After this, `get_dom` / `screenshot { kind: "aut" }` / `get_pinned_command` reflect the pinned step.',
       inputSchema: {
-        testIndex: z.number().int().nonnegative(),
+        failureIndex: z.number().int().nonnegative().optional(),
+        testIndex: z.number().int().nonnegative().optional(),
         commandIndex: z.number().int().nonnegative().optional(),
         commandNumber: z.union([z.number().int().nonnegative(), z.string()]).optional(),
       },
     },
-    async ({ testIndex, commandIndex, commandNumber }) => {
-      if (commandIndex == null && commandNumber == null) {
-        return textResult('Provide either commandNumber or commandIndex.');
-      }
+    async ({ failureIndex, testIndex, commandIndex, commandNumber }) => {
       await ensureAttached();
-      const result = await cdp.evalOnRunner(probe.stepToExpr(testIndex, { commandIndex, commandNumber }));
+      let tIdx = testIndex;
+      let cIdx = commandIndex;
+      let cNum = commandNumber;
+      let resolvedFromFailureIndex = false;
+      if (failureIndex != null && tIdx == null && cIdx == null && cNum == null) {
+        const failures = await cdp.evalOnRunner(probe.FAILURES);
+        const list = failures?.failures || [];
+        const f = failureIndex < list.length ? list[failureIndex] : list.find((x) => x.index === failureIndex);
+        if (!f) return textResult(`No failure at failureIndex=${failureIndex}. Got ${list.length} failures with reporter indices: [${list.map((x) => x.index).join(', ')}]`);
+        tIdx = f.index;
+        cIdx = f.relatedCommandIndex;
+        cNum = f.relatedCommandNumber;
+        resolvedFromFailureIndex = true;
+        if (cIdx == null && cNum == null) return textResult(`Failure ${failureIndex} (test index ${tIdx}) has no identified failed command.`);
+      }
+      if (tIdx == null) return textResult('Provide either failureIndex OR testIndex (with commandNumber / commandIndex).');
+      if (cIdx == null && cNum == null) return textResult('Provide commandNumber or commandIndex (or use failureIndex to auto-resolve).');
+      const result = await cdp.evalOnRunner(probe.stepToExpr(tIdx, { commandIndex: cIdx, commandNumber: cNum }));
+      if (resolvedFromFailureIndex) result._resolvedFromFailureIndex = failureIndex;
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -466,7 +502,7 @@ async function runMcp() {
     'screenshot',
     {
       title: 'Take screenshot',
-      description: 'PNG screenshot. kind=full (default) captures the whole runner viewport including the reporter sidebar. kind=aut clips to the app-under-test iframe only.',
+      description: 'PNG screenshot. kind=full (default) captures the whole runner viewport including the reporter sidebar. kind=aut clips to the app-under-test iframe only.\n\n⚠ **Scroll position caveat**: the screenshot reflects whatever the AUT iframe was last scrolled to — typically the top, or wherever the failed command left it. The image may show only a header / dialog and miss the relevant element entirely. To assert *what is actually rendered*, cross-check with `find_in_aut { selector }` — it queries the DOM directly and is unaffected by scroll. For a positive ID of the visual state at a specific step, call `step_to` first.',
       inputSchema: {
         kind: z.enum(['full', 'aut']).optional(),
       },
@@ -643,12 +679,17 @@ async function runMcp() {
     'clear_app_state',
     {
       title: 'Clear localStorage / sessionStorage / cookies / IndexedDB (AUT)',
-      description: 'Best-effort wipe of the app-under-test storage: clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database listed by indexedDB.databases(). Returns the count of each. Pair with `rerun_spec` for a clean-slate re-run. WRITE OPERATION on the app — use deliberately.',
-      inputSchema: {},
+      description: 'Best-effort wipe of the app-under-test storage: clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database listed by indexedDB.databases(). Returns counts + `databasesSkipped: []`. Pair with `rerun_spec` for a clean-slate re-run. WRITE OPERATION on the app — use deliberately.\n\n⚠ **Some databases hold permission state** that affects subsequent tests in non-obvious ways:\n  • `auth` typically caches permission grants like `permissionStatuses.geolocation: true` — wiping it can break GPS-dependent tests on the next run.\n  • App-specific caches may hold user-role / feature-flag state.\nPass `skipDatabases: ["auth", ...]` to preserve those. Granular flags `skipLocalStorage` / `skipSessionStorage` / `skipCookies` also available.',
+      inputSchema: {
+        skipDatabases: z.array(z.string()).optional(),
+        skipLocalStorage: z.boolean().optional(),
+        skipSessionStorage: z.boolean().optional(),
+        skipCookies: z.boolean().optional(),
+      },
     },
-    async () => {
+    async (args = {}) => {
       await ensureAttached();
-      const result = await cdp.evalOnRunner(probe.CLEAR_APP_STATE);
+      const result = await cdp.evalOnRunner(probe.clearAppStateExpr(args));
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -675,15 +716,19 @@ async function runMcp() {
     'reset_and_rerun',
     {
       title: 'Clear app state + rerun spec (one-shot)',
-      description: 'Convenience: `clear_app_state` then `rerun_spec` with verification + auto-escalation to `location.reload()` if the reporter-button click strategy doesn\'t take. The realistic combined workflow when a previous run left bad state behind. Returns `{ cleared, ...rerunResult }` including `actuallyStarted`, `escalatedToForceReload`, and an `attempts` array. Pass `forceReload: true` to skip the click-first attempt.',
+      description: 'Convenience: `clear_app_state` then `rerun_spec` with verification + auto-escalation to `location.reload()` if the reporter-button click strategy doesn\'t take. The realistic combined workflow when a previous run left bad state behind. Returns `{ cleared, ...rerunResult }` including `actuallyStarted`, `escalatedToForceReload`, and an `attempts` array. Pass `forceReload: true` to skip the click-first attempt.\n\n`skipDatabases` (e.g. `["auth"]`) preserves named IndexedDB databases — useful when wiping `auth` would lose persisted permission grants like `permissionStatuses.geolocation: true` and break GPS-dependent tests.',
       inputSchema: {
         timeoutMs: z.number().int().positive().max(60000).optional(),
         forceReload: z.boolean().optional(),
+        skipDatabases: z.array(z.string()).optional(),
+        skipLocalStorage: z.boolean().optional(),
+        skipSessionStorage: z.boolean().optional(),
+        skipCookies: z.boolean().optional(),
       },
     },
-    async ({ timeoutMs = 15000, forceReload = false } = {}) => {
+    async ({ timeoutMs = 15000, forceReload = false, skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies } = {}) => {
       await ensureAttached();
-      const cleared = await cdp.evalOnRunner(probe.CLEAR_APP_STATE);
+      const cleared = await cdp.evalOnRunner(probe.clearAppStateExpr({ skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies }));
       const rerun = await triggerAndVerifyRerun({ awaitFlag: true, timeoutMs, forceReload });
       return textResult(JSON.stringify({ cleared, ...rerun }, null, 2));
     },
@@ -744,7 +789,7 @@ async function runMcp() {
     'wait_for_failure',
     {
       title: 'Block until the failure count grows (or timeout)',
-      description: 'Polls the reporter until the failed-test count exceeds `baseline` (default: current count). Returns the new failure when it appears, or `{ timedOut: true }` after `timeoutMs` (max 120000, default 60000). Use this in a watch loop: call `get_overview` to capture baseline, then ask the agent to call `wait_for_failure { baseline }` so it can react to the next failure without you having to nudge it.',
+      description: 'Polls the reporter until the failed-test count exceeds `baseline` (default: current count). Returns the new failure when it appears, or `{ timedOut: true, currentCounts: {...} }` after `timeoutMs` (max 120000, default 60000). When it times out the response includes the latest pass/fail/pending/unknown counts so the caller can distinguish "spec is still running" from "spec passed cleanly". For an explicit "wait until the spec finishes" primitive, prefer `wait_for_completion`.',
       inputSchema: {
         baseline: z.number().int().nonnegative().optional(),
         timeoutMs: z.number().int().positive().max(120000).optional(),
@@ -754,20 +799,72 @@ async function runMcp() {
     async ({ baseline, timeoutMs = 60000, pollMs = 1000 }) => {
       await ensureAttached();
       let base = baseline;
+      let lastOverview = null;
       if (base == null) {
-        const o = await cdp.evalOnRunner(probe.OVERVIEW);
-        base = o?.counts?.failed ?? 0;
+        lastOverview = await cdp.evalOnRunner(probe.OVERVIEW);
+        base = lastOverview?.counts?.failed ?? 0;
       }
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         const o = await cdp.evalOnRunner(probe.OVERVIEW);
+        lastOverview = o;
         const failed = o?.counts?.failed ?? 0;
         if (failed > base) {
-          return textResult(JSON.stringify({ baseline: base, currentFailed: failed, firstFailure: o.firstFailure }, null, 2));
+          return textResult(JSON.stringify({ baseline: base, currentFailed: failed, currentCounts: o.counts, firstFailure: o.firstFailure }, null, 2));
         }
         await new Promise((r) => setTimeout(r, pollMs));
       }
-      return textResult(JSON.stringify({ timedOut: true, baseline: base, waitedMs: timeoutMs }, null, 2));
+      const counts = lastOverview?.counts || null;
+      const finishedCleanly = counts && counts.unknown === 0 && counts.running === 0 && counts.total > 0 && counts.failed === 0;
+      return textResult(JSON.stringify({
+        timedOut: true,
+        baseline: base,
+        waitedMs: timeoutMs,
+        currentCounts: counts,
+        finishedCleanly,
+        hint: finishedCleanly
+          ? 'Timed out without new failures because the spec finished cleanly (all tests passed).'
+          : 'Timed out without new failures — the spec may still be running. Call wait_for_completion to block until finished.',
+      }, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'wait_for_completion',
+    {
+      title: 'Block until every test has a final state (passed / failed / pending)',
+      description: 'Polls the reporter until `unknown === 0` and `running === 0` AND the total is > 0 (i.e. every test has been evaluated). Returns the final counts and whether the spec passed cleanly. Use this as the canonical "wait for the run to finish" primitive — cleaner than treating a `wait_for_failure` timeout as success.',
+      inputSchema: {
+        timeoutMs: z.number().int().positive().max(600000).optional(),
+        pollMs: z.number().int().positive().max(5000).optional(),
+      },
+    },
+    async ({ timeoutMs = 180000, pollMs = 1000 } = {}) => {
+      await ensureAttached();
+      const deadline = Date.now() + timeoutMs;
+      let last = null;
+      while (Date.now() < deadline) {
+        const o = await cdp.evalOnRunner(probe.OVERVIEW);
+        last = o;
+        const c = o?.counts;
+        if (c && c.total > 0 && (c.unknown || 0) === 0 && (c.running || 0) === 0) {
+          return textResult(JSON.stringify({
+            completed: true,
+            passed: c.failed === 0,
+            counts: c,
+            firstFailure: o.firstFailure,
+            waitedMs: timeoutMs - (deadline - Date.now()),
+          }, null, 2));
+        }
+        await new Promise((r) => setTimeout(r, pollMs));
+      }
+      return textResult(JSON.stringify({
+        completed: false,
+        timedOut: true,
+        waitedMs: timeoutMs,
+        currentCounts: last?.counts || null,
+        hint: 'Spec did not finish within the timeout. Inspect with get_overview / get_live_commands to see what is stuck.',
+      }, null, 2));
     },
   );
 
