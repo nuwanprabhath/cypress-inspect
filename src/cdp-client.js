@@ -84,17 +84,13 @@ class CdpClient {
     try {
       const client = await CDP({ target: info.webSocketDebuggerUrl, local: false });
       const { Runtime, Log, Page, Network } = client;
-      await Runtime.enable();
-      await Log.enable().catch(() => {});
-      await Page.enable().catch(() => {});
-      await Network.enable().catch(() => {});
 
+      // Register ALL listeners BEFORE calling enable() so we don't miss the
+      // initial executionContextCreated bursts that Chrome fires immediately
+      // after Runtime.enable() — those arrive as async WebSocket messages and
+      // can be lost if the handler is added after the await resolves.
       const record = { client, info, kind, contexts: new Map() };
-      this.targets.set(info.id, record);
 
-      // Track execution contexts (one per frame). Cypress wraps console.* in
-      // the AUT iframe so Runtime.consoleAPICalled may not fire for that frame
-      // — exposing the context list helps diagnose silent capture.
       Runtime.executionContextCreated?.(({ context }) => {
         record.contexts.set(context.id, {
           id: context.id,
@@ -191,6 +187,14 @@ class CdpClient {
       client.on('disconnect', () => {
         this.targets.delete(info.id);
       });
+
+      // Enable domains AFTER all listeners are registered so that the initial
+      // executionContextCreated events fired by Runtime.enable() are caught.
+      this.targets.set(info.id, record);
+      await Runtime.enable();
+      await Log.enable().catch(() => {});
+      await Page.enable().catch(() => {});
+      await Network.enable().catch(() => {});
     } catch (err) {
       this.lastError = `attach ${info.url}: ${err.message}`;
     }

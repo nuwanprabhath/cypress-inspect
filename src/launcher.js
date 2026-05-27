@@ -1,7 +1,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const { writeSession, clearSession } = require('./session');
+const { writeSession, clearSession, detectChromePortFromProcesses } = require('./session');
 
 function findCypressBin(cwd) {
   let dir = cwd;
@@ -71,7 +71,22 @@ async function runOpen(extraArgs) {
   child.stdout.on('data', (c) => onData(c, 'stdout'));
   child.stderr.on('data', (c) => onData(c, 'stderr'));
 
+  // Fallback: if the debug-log regex never fires (e.g. Cypress changed its log
+  // format), poll for a Cypress-managed Chrome process every 5 s and write the
+  // session from the process list. Stop once a port has been found.
+  const pollTimer = setInterval(() => {
+    if (currentPort != null) { clearInterval(pollTimer); return; }
+    const port = detectChromePortFromProcesses();
+    if (port && port !== currentPort) {
+      currentPort = port;
+      console.error(`[cypress-inspect] Detected CDP port via process scan: ${port}`);
+      writeSession({ port, pid: child.pid, cwd, startedAt: Date.now() }).catch(() => {});
+      clearInterval(pollTimer);
+    }
+  }, 5000);
+
   const cleanup = async () => {
+    clearInterval(pollTimer);
     await clearSession();
   };
   process.on('SIGINT', () => child.kill('SIGINT'));
