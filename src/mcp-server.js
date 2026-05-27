@@ -716,7 +716,7 @@ async function runMcp() {
     'reset_and_rerun',
     {
       title: 'Clear app state + rerun spec (one-shot)',
-      description: 'Convenience: `clear_app_state` then `rerun_spec` with verification + auto-escalation to `location.reload()` if the reporter-button click strategy doesn\'t take. The realistic combined workflow when a previous run left bad state behind. Returns `{ cleared, ...rerunResult }` including `actuallyStarted`, `escalatedToForceReload`, and an `attempts` array. Pass `forceReload: true` to skip the click-first attempt.\n\n`skipDatabases` (e.g. `["auth"]`) preserves named IndexedDB databases — useful when wiping `auth` would lose persisted permission grants like `permissionStatuses.geolocation: true` and break GPS-dependent tests.',
+      description: 'Safe clear-and-rerun: navigates to the Cypress specs list first (stopping any in-progress run so the app is idle), wipes all app storage, waits for the app to settle, then navigates back to the spec to start a fresh run. This prevents the race condition where clearing cache mid-run causes the app to crash.\n\nSequence: (1) capture current spec file, (2) navigate to specs list, (3) clear localStorage / sessionStorage / cookies / IndexedDB, (4) wait `postClearWaitMs` (default 5000ms) for the app to settle, (5) navigate back to the spec runner (auto-starts the run), (6) verify the run started.\n\nReturns `{ cleared, specFile, postClearWaitMs, actuallyStarted, escalatedToForceReload, attempts }`.\n\n`postClearWaitMs` (default 5000) — how long to wait after clearing before navigating back. Increase for apps that eagerly re-fetch data on startup.\n`skipDatabases` (e.g. `["auth"]`) preserves named IndexedDB databases — useful when wiping `auth` would lose persisted permission grants like `permissionStatuses.geolocation: true` and break GPS-dependent tests.',
       inputSchema: {
         timeoutMs: z.number().int().positive().max(60000).optional(),
         forceReload: z.boolean().optional(),
@@ -724,13 +724,49 @@ async function runMcp() {
         skipLocalStorage: z.boolean().optional(),
         skipSessionStorage: z.boolean().optional(),
         skipCookies: z.boolean().optional(),
+        postClearWaitMs: z.number().int().nonnegative().max(30000).optional(),
       },
     },
-    async ({ timeoutMs = 15000, forceReload = false, skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies } = {}) => {
+    async ({ timeoutMs = 15000, forceReload = false, skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies, postClearWaitMs = 5000 } = {}) => {
       await ensureAttached();
-      const cleared = await cdp.evalOnRunner(probe.clearAppStateExpr({ skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies }));
+
+      // Step 1 — capture the current spec file before navigating away.
+      const specFile = await cdp.evalOnRunner(`(() => {
+        const m = window.location.hash.match(/[?&]file=([^&]+)/);
+        return m ? decodeURIComponent(m[1]) : null;
+      })()`).catch(() => null);
+
+      // Step 2 — navigate to the specs list to stop any in-progress test run.
+      // This prevents the app from reading/writing storage while we wipe it.
+      await cdp.evalOnRunner(`window.location.hash = '/specs'`).catch(() => {});
+      await new Promise((r) => setTimeout(r, 1500));
+
+      // Step 3 — clear all app storage. The AUT iframe is gone now that we're
+      // on the specs list, but the runner page shares the same origin so the
+      // updated clearAppStateExpr falls back to window and reaches the same
+      // localStorage / IndexedDB.
+      const cleared = await cdp.evalOnRunner(
+        probe.clearAppStateExpr({ skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies }),
+      );
+
+      // Step 4 — wait after clearing so the app isn't mid-initialisation when
+      // the spec runner loads. Apps that eagerly re-fetch data on storage events
+      // need this breathing room before the test's before-all hook runs.
+      await new Promise((r) => setTimeout(r, postClearWaitMs));
+
+      // Step 5 — navigate back to the spec runner, which auto-starts the run.
+      if (specFile) {
+        await cdp.evalOnRunner(
+          `window.location.href = '/__/#/specs/runner?file=' + encodeURIComponent(${JSON.stringify(specFile)})`,
+        ).catch(() => {});
+      } else {
+        // No spec file found — fall back to a plain reload of the runner.
+        await cdp.evalOnRunner(`window.location.reload()`).catch(() => {});
+      }
+
+      // Step 6 — wait for the reporter to show the spec has started.
       const rerun = await triggerAndVerifyRerun({ awaitFlag: true, timeoutMs, forceReload });
-      return textResult(JSON.stringify({ cleared, ...rerun }, null, 2));
+      return textResult(JSON.stringify({ cleared, specFile, postClearWaitMs, ...rerun }, null, 2));
     },
   );
 

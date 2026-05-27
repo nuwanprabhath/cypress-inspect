@@ -634,10 +634,14 @@ function clearAppStateExpr({ skipDatabases = [], skipLocalStorage = false, skipS
     const skipDb = new Set(${JSON.stringify(skipDatabases)});
     const report = { localStorage: 0, sessionStorage: 0, cookies: 0, databasesDeleted: [], databasesSkipped: [], errors: [] };
     try {
+      // Use AUT iframe when present (normal mid-run case). Fall back to the
+      // runner window itself — same origin as the app, so localStorage /
+      // IndexedDB are identical. This allows clearing when the spec runner
+      // has navigated away to the specs list and the AUT iframe is gone.
       const aut = document.querySelector('iframe.aut-iframe');
-      if (!aut || !aut.contentWindow) return { error: 'AUT iframe not found' };
-      const w = aut.contentWindow;
-      const d = aut.contentDocument;
+      const w = (aut && aut.contentWindow) || window;
+      const d = (aut && aut.contentDocument) || document;
+      if (!w) return { error: 'AUT iframe not found' };
       if (!${skipLocalStorage}) {
         try { report.localStorage = w.localStorage.length; w.localStorage.clear(); } catch (e) { report.errors.push('localStorage: ' + e.message); }
       }
