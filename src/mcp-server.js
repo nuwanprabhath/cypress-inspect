@@ -181,7 +181,7 @@ async function runMcp() {
     'get_overview',
     {
       title: 'Get debug overview (start here)',
-      description: 'One-call orientation for an agent debugging a Cypress failure. Returns: spec file, pass/fail/pending counts, the first failed test (with title, suite path, error message, stack, code frame), and the currently in-flight test if any. This is the recommended first tool to call after status.',
+      description: 'One-call orientation for an agent debugging a Cypress failure. Returns: spec file, pass/fail/pending counts, the first failed test (with title, suite path, error message, stack, code frame), the currently in-flight test, and `slowCommands` (non-null when an active command has consumed ≥50% of its timeout budget — a proactive warning before failure). This is the recommended first tool to call after status.',
       inputSchema: {},
     },
     async () => {
@@ -283,12 +283,14 @@ async function runMcp() {
     'get_live_commands',
     {
       title: 'Get live cy.queue (currently-running test only)',
-      description: 'Return Cypress.cy.queue for the in-flight test. Only meaningful while a test is mid-run; for finished tests use `get_test_commands`.',
-      inputSchema: {},
+      description: 'Return Cypress.cy.queue for the in-flight test. Only meaningful while a test is mid-run; for finished tests use `get_test_commands`.\n\nEach command includes:\n  • `active: true` on the currently-executing command (identified by `activeIndex` at the top level)\n  • `elapsedMs` + `timeoutBudgetUsedPct` on the active command so you can see how close it is to timing out\n  • `timeout` when the command carries an explicit timeout\n  • `suspiciouslyLargeTimeout: true` when timeout > 30 s (a red flag in normal test runs)\n\nSet `summarize: true` for a collapsed view — returns only `active`, `nextAssertion`, and `suspiciouslyLargeTimeoutCommands` instead of all raw rows. Use this when you just want to know what is stuck without parsing 100+ commands.',
+      inputSchema: {
+        summarize: z.boolean().optional(),
+      },
     },
-    async () => {
+    async ({ summarize } = {}) => {
       await ensureAttached();
-      const result = await cdp.evalOnRunner(probe.LIVE_COMMANDS);
+      const result = await cdp.evalOnRunner(probe.liveCommandsExpr({ summarize: !!summarize }));
       return textResult(JSON.stringify(result, null, 2));
     },
   );

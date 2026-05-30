@@ -53,7 +53,26 @@ const OVERVIEW = `(() => {
       duration: liveRunner.test.duration,
     } : null;
 
-    return { spec, counts, firstFailure, liveTest };
+    // Detect at-risk commands: active command has consumed >50% of its timeout budget.
+    let slowCommands = null;
+    try {
+      const now = Date.now();
+      const q = (C.cy && C.cy.queue && (C.cy.queue.get ? C.cy.queue.get() : C.cy.queue)) || [];
+      const atRisk = q.reduce((acc, c, i) => {
+        const a = c.attributes || c;
+        if (a.state !== 'active') return acc;
+        const timeout = a.options && a.options.timeout != null ? a.options.timeout : null;
+        const startedAt = a.startedAt || null;
+        if (!timeout || !startedAt) return acc;
+        const elapsedMs = now - new Date(startedAt).getTime();
+        const pct = Math.round(elapsedMs / timeout * 100);
+        if (pct >= 50) acc.push({ index: i, name: a.name, elapsedMs, timeout, budgetUsedPct: pct });
+        return acc;
+      }, []);
+      if (atRisk.length > 0) slowCommands = atRisk;
+    } catch (_) {}
+
+    return { spec, counts, firstFailure, liveTest, slowCommands };
   } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
 })()`;
 
@@ -187,12 +206,16 @@ function commandsForTestExpr(testIndex, { full = false, argMaxBytes = 240, textM
 // Function-valued args (coverage callbacks, .then handlers, etc.) are
 // reduced to a one-line summary — the source body is rarely useful and can
 // dominate the payload (~40 KB for one coverage plugin).
-const LIVE_COMMANDS = `(() => {
+// Optional: pass summarize=true for a collapsed view (active + next assertion + large-timeout cmds).
+function liveCommandsExpr({ summarize: doSummarize = false } = {}) {
+  return `(() => {
   try {
     const C = window.Cypress;
     if (!C || !C.cy) return { error: 'No active Cypress.cy on runner' };
     const queue = (C.cy.queue && (C.cy.queue.get ? C.cy.queue.get() : C.cy.queue)) || [];
-    const summarize = (x) => {
+    const now = Date.now();
+    const LARGE_TIMEOUT_MS = 30000;
+    const summarizeArg = (x) => {
       if (typeof x === 'function') return '[Function: ' + (x.name || 'anonymous') + ']';
       if (typeof x === 'string') return x.slice(0, 240);
       try {
@@ -200,13 +223,47 @@ const LIVE_COMMANDS = `(() => {
         return s == null ? String(x).slice(0, 240) : s.slice(0, 240);
       } catch { return String(x).slice(0, 240); }
     };
-    return queue.map((c, i) => {
+    let activeIndex = -1;
+    const commands = queue.map((c, i) => {
       const a = c.attributes || c;
-      const args = (a.args || []).map(summarize);
-      return { index: i, name: a.name, args, state: a.state, type: a.type };
+      const opts = a.options || {};
+      const timeout = opts.timeout != null ? opts.timeout : null;
+      const startedAt = a.startedAt || null;
+      const isActive = a.state === 'active';
+      if (isActive && activeIndex === -1) activeIndex = i;
+      const elapsedMs = isActive && startedAt ? now - new Date(startedAt).getTime() : null;
+      const row = {
+        index: i,
+        name: a.name,
+        args: (a.args || []).map(summarizeArg),
+        state: a.state,
+        type: a.type,
+      };
+      if (isActive) row.active = true;
+      if (timeout != null) row.timeout = timeout;
+      if (elapsedMs != null) row.elapsedMs = elapsedMs;
+      if (timeout != null && elapsedMs != null) row.timeoutBudgetUsedPct = Math.round(elapsedMs / timeout * 100);
+      if (timeout != null && timeout > LARGE_TIMEOUT_MS) row.suspiciouslyLargeTimeout = true;
+      return row;
     });
+    if (${doSummarize}) {
+      const active = activeIndex >= 0 ? commands[activeIndex] : null;
+      const nextAssertion = commands.slice(activeIndex + 1).find(r => r.name === 'assert' || r.name === 'should');
+      const largeTOCmds = commands.filter(r => r.suspiciouslyLargeTimeout && r.index !== activeIndex);
+      return {
+        totalCommands: commands.length,
+        activeIndex,
+        active,
+        nextAssertion: nextAssertion || null,
+        suspiciouslyLargeTimeoutCommands: largeTOCmds,
+      };
+    }
+    return { totalCommands: commands.length, activeIndex, commands };
   } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
 })()`;
+}
+// Convenience: full (non-summarized) live commands, backward-compatible export.
+const LIVE_COMMANDS = liveCommandsExpr({ summarize: false });
 
 // Click on a specific command in a specific test panel to time-travel. Caller
 // may pass either commandIndex (raw DOM position 0..N) OR commandNumber (the
@@ -813,6 +870,7 @@ module.exports = {
   FAILURES,
   LIST_TESTS,
   LIVE_COMMANDS,
+  liveCommandsExpr,
   AUT_RECT,
   AUT_INFO,
   PINNED_COMMAND,
