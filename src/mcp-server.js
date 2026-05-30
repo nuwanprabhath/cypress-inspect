@@ -195,7 +195,7 @@ async function runMcp() {
     'get_failures',
     {
       title: 'List all failed tests with details',
-      description: 'Return every failed test with suite, title, error message, stack, and code frame.\n\nAuto-annotations on every call:\n  • `rootCause: true` on the first failure; `looksLikeCascade: true` + `cascadeOf: <index>` on subsequent failures matching downstream patterns (timeouts, "Cypress test was stopped while running this command", auth/session deep-equal failures).\n  • Compare-style errors → `parsedDiff: { summary, diffs: [{ path, pathSegments, expected, actual }] }`.\n  • Top-level `flakeSignals: [{ id, explain, count, sample }]` populated by scanning the recent console buffer for known flake warnings ("random item from dropdown", "no search query provided for dropdown"). The matching IDs are also attached to the root-cause failure as `flakeSignals: ["..."]`.\n\nSet `dedupe: true` to split the response into `failures` (root + independent) and `cascadingFailures` (one-line summaries). Dedupe mode also surfaces `rootCauses: [<index>]` at the top level.',
+      description: 'Return every failed test with suite, title, error message, stack, and code frame.\n\nAuto-annotations on every call:\n  • `rootCause: true` on the first failure; `looksLikeCascade: true` + `cascadeOf: <index>` on subsequent failures matching downstream patterns.\n  • Cascade annotations now include `cascadeEvidence` (what pattern matched: `"test-stopped"`, `"auth-context-mismatch"`, or `"timeout"`) and `cascadeConfidence: "high" | "low"`. Timeout-only matches also carry `possiblyIndependent: true` — a shared timeout pattern can mean the same underlying bug rather than state pollution from the root failure.\n  • Compare-style errors → `parsedDiff: { summary, diffs: [{ path, pathSegments, expected, actual }] }`.\n  • Top-level `flakeSignals: [{ id, explain, count, sample }]` populated by scanning the recent console buffer for known flake warnings ("random item from dropdown", "no search query provided for dropdown"). The matching IDs are also attached to the root-cause failure as `flakeSignals: ["..."]`.\n\nSet `dedupe: true` to split the response into `failures` (root + independent) and `cascadingFailures` (one-line summaries). Dedupe mode also surfaces `rootCauses: [<index>]` at the top level.',
       inputSchema: {
         dedupe: z.boolean().optional(),
       },
@@ -960,13 +960,22 @@ async function runMcp() {
     'eval',
     {
       title: 'Evaluate JavaScript on the spec-runner page',
-      description: 'Escape hatch: run arbitrary JS on the spec-runner page where `window.Cypress`, the reporter DOM, and the AUT iframe all live. Must return a JSON-serializable value. Use for things the built-in tools do not cover (e.g. inspecting reporter MobX state, custom Cypress globals).',
+      description: 'Escape hatch: run arbitrary JS on the spec-runner page where `window.Cypress`, the reporter DOM, and the AUT iframe all live. Must return a JSON-serializable value. Use for things the built-in tools do not cover (e.g. inspecting reporter MobX state, custom Cypress globals).\n\n⚠ **Live state only**: `eval` always executes against the current live page, even when a snapshot is pinned via `step_to`. Window globals (e.g. `window.myComponent`) reflect the state of the *latest* test that ran, not the pinned command\'s point in time. A `_pinnedSnapshot` warning is prepended to the result when a pin is active.',
       inputSchema: { expression: z.string() },
     },
     async ({ expression }) => {
       await ensureAttached();
-      const value = await cdp.evalOnRunner(expression);
-      return textResult(typeof value === 'string' ? value : JSON.stringify(value, null, 2));
+      const [value, pinned] = await Promise.all([
+        cdp.evalOnRunner(expression),
+        cdp.evalOnRunner(probe.PINNED_COMMAND).catch(() => null),
+      ]);
+      const raw = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+      if (pinned) {
+        const label = `${pinned.name ?? ''}${pinned.arg ? ' ' + pinned.arg : ''}`.trim();
+        const warn = `_pinnedSnapshot: eval reflects LIVE AUT state, not the pinned snapshot at command ${pinned.number ?? '?'}${label ? ' (' + label + ')' : ''}. Window globals may belong to a later test.\n\n`;
+        return textResult(warn + raw);
+      }
+      return textResult(raw);
     },
   );
 

@@ -53,26 +53,32 @@ function unquote(s) {
 }
 
 // Heuristic: mark a failure as a likely cascade from an earlier one.
-// Cypress emits these patterns when a test panics out:
-//   - "Cypress test was stopped while running this command."
-//   - "Timed out retrying after Xms: Expected to find element: ..."
-//     (often shows up because the previous test left the app in the wrong state)
-//   - "expected { ... } to deeply equal { ... }" on auth/session context
+// Patterns are split by confidence:
+//   HIGH — clear state-pollution signals (stopped mid-run, auth context mismatch)
+//   LOW  — shared timeout pattern only; the test may have the same underlying bug
+//          rather than being caused by the root failure
 // We do NOT mark the first failure as cascade, ever — it's the root.
+const CASCADE_PATTERNS = [
+  { re: /Cypress test was stopped while running/i, evidence: 'test-stopped', confidence: 'high' },
+  { re: /expected\s+\{[^}]*\}\s+to deeply equal/i, evidence: 'auth-context-mismatch', confidence: 'high' },
+  { re: /Timed out retrying after \d+ms/i, evidence: 'timeout', confidence: 'low' },
+];
+
 function annotateCascades(failures) {
   if (!failures || failures.length === 0) return failures;
-  const cascadePatterns = [
-    /Cypress test was stopped while running/i,
-    /Timed out retrying after \d+ms/i,
-    /expected\s+\{[^}]*\}\s+to deeply equal/i,
-  ];
   const rootIndex = 0;
   return failures.map((f, i) => {
     if (i === rootIndex) return { ...f, rootCause: true };
-    const looksLikeCascade = cascadePatterns.some((re) => re.test(f.message || ''));
-    return looksLikeCascade
-      ? { ...f, looksLikeCascade: true, cascadeOf: failures[rootIndex].index ?? rootIndex }
-      : f;
+    const match = CASCADE_PATTERNS.find(({ re }) => re.test(f.message || ''));
+    if (!match) return f;
+    const annotation = {
+      looksLikeCascade: true,
+      cascadeOf: failures[rootIndex].index ?? rootIndex,
+      cascadeEvidence: match.evidence,
+      cascadeConfidence: match.confidence,
+    };
+    if (match.confidence === 'low') annotation.possiblyIndependent = true;
+    return { ...f, ...annotation };
   });
 }
 
