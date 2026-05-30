@@ -1,6 +1,136 @@
 // Self-contained JS expressions evaluated in the Cypress spec-runner page.
 // All assume `window.Cypress` exists on the runner (Cypress >= 12).
 
+// ─────────────────────────── reporter DOM helpers ───────────────────────────
+// Shared JS injected into command-log expressions. Encapsulates the parts of
+// the Cypress reporter DOM that have shifted across reporter versions and that
+// repeatedly bit us:
+//   • A test panel's open/closed state lives on the `.collapsible` CHILD of
+//     `.test.runnable` (class `is-open`), NOT on `.test.runnable` itself.
+//   • The clickable header that toggles a panel is `.collapsible-header`
+//     (nested inside `.collapsible-header-wrapper`), and it only responds to a
+//     full pointer+mouse event sequence.
+//   • Command rows (`.command-wrapper`) are VIRTUALIZED — they only exist in
+//     the DOM while the panel is open AND scrolled into view, and they render
+//     asynchronously after the open click, so reads must wait/poll.
+//   • Pinning (time-travel) is driven by an onClick on `.command-wrapper-container`
+//     (a descendant of `.command-pin-target`). Clicking the outer
+//     `.command-wrapper` does nothing — the event bubbles up past the handler.
+//   • A pinned row carries the class `command-is-pinned`.
+// `evalOnRunner` runs with awaitPromise:true, so these helpers can be async.
+const REPORTER_DOM_HELPERS = `
+    const __sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const __testEls = () => [...document.querySelectorAll('.test.runnable')];
+    const __collapsible = (el) => (el ? el.querySelector(':scope > .collapsible') : null);
+    const __isOpen = (el) => {
+      if (!el) return false;
+      const c = __collapsible(el);
+      return !!(c && c.classList.contains('is-open')) || el.classList.contains('is-open');
+    };
+    const __header = (el) => {
+      const c = __collapsible(el) || el;
+      return c.querySelector(':scope > .collapsible-header-wrapper .collapsible-header')
+        || c.querySelector('.collapsible-header')
+        || el.querySelector(':scope > .collapsible-header-wrapper')
+        || el.querySelector('.collapsible-header-wrapper');
+    };
+    // Native .click() ONLY. Do NOT dispatch mouseover/pointerover to drive the
+    // reporter: hovering a navigation command triggers Cypress's before/after
+    // snapshot auto-cycle, and a synthetic hover with no matching mouseout leaves
+    // the AUT stuck flickering between snapshots. React's onClick fires fine from
+    // a native click, which is enough to open panels and pin commands.
+    const __click = (node) => { if (node) node.click(); };
+    // Clear any lingering hover so the snapshot preview can't get stuck cycling.
+    const __clearHover = () => {
+      document.querySelectorAll('.command-wrapper-text, .command-wrapper-container, .command-wrapper').forEach((n) => {
+        n.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, cancelable: true, view: window, relatedTarget: document.body }));
+      });
+    };
+    // EXACT '.command-wrapper' only. The substring form [class*="command-wrapper"]
+    // also matches the nested '.command-wrapper-container' / '.command-wrapper-text'
+    // divs, triple-counting every command and making DOM indices unstable/noisy.
+    const __wrappers = (el) => [...el.querySelectorAll('.command-wrapper')];
+    const __openPanel = (el) => { if (!__isOpen(el)) { __click(__header(el)); return true; } return false; };
+    // Open the panel if needed, scroll into view, and poll until the command rows
+    // have rendered AND the count has STABILIZED. Cypress renders the log
+    // progressively (we have seen 4 rows grow to 177), so returning on the first
+    // non-zero count yields a partial list. Never toggles an already-open panel.
+    const __ensureOpen = async (el, timeoutMs) => {
+      const deadline = Date.now() + (timeoutMs || 2500);
+      const clicked = __openPanel(el);
+      el.scrollIntoView({ block: 'center' });
+      let last = -1, stable = 0;
+      while (Date.now() < deadline) {
+        const n = __wrappers(el).length;
+        if (__isOpen(el) && n > 0 && n === last) { if (++stable >= 3) break; } else stable = 0;
+        last = n;
+        await __sleep(60);
+      }
+      return { clicked, open: __isOpen(el), rows: __wrappers(el).length };
+    };
+    const __cmdNumber = (w) => { const n = w.querySelector('.command-number, [class*="command-number"]'); return n ? n.innerText.trim() : null; };
+    const __cmdMethod = (w) => { const m = w.querySelector('.command-method, [class*="command-method"]'); return m ? m.innerText.trim() : null; };
+    // Auto-logged network / resource rows that Cypress injects into the command
+    // log (heartbeats, asset loads, xhr). These dominate finished-spec panels
+    // (we saw ~70 '(fetch) HEAD 204 /_health' rows) and drown out the cy.*
+    // commands a developer actually wrote. NOT filtered: '(new url)' navigations
+    // and '(uncaught exception)' — both are debugging signal.
+    const __NOISE_RE = /^\\(\\s*(fetch|xhr fetch|xhr|request|image|img|script|stylesheet|css|font|websocket|ws|preflight|other)\\b/i;
+    const __isNoiseCommand = (name) => !!name && __NOISE_RE.test(name);
+    // The element carrying the pin onClick handler — clicking this (not the outer
+    // wrapper) is what actually time-travels the AUT.
+    const __pinTarget = (w) => w.querySelector('.command-wrapper-container') || w.querySelector('.command-pin-target') || w;
+    const __pinnedEl = () => document.querySelector('.command-is-pinned, .command-wrapper.command-is-pinned, [class*="command-is-pinned"], [class*="command-pinned"], .command-wrapper.is-pinned');
+    // Snapshot before/after toggle. After a command is pinned, Cypress shows two
+    // buttons ('before' / 'after') for commands that captured both snapshots
+    // (e.g. a click that navigated). The active button carries a purple bg
+    // (Tailwind 'bg-purple-*'); the inactive one is gray.
+    const __snapshotButtons = () => [...document.querySelectorAll('button')].filter((n) => {
+      const t = (n.innerText || '').trim().toLowerCase();
+      return (t === 'before' || t === 'after') && n.children.length === 0;
+    });
+    const __snapshotActive = (b) => /bg-purple/.test((b && b.className) || '');
+    // The currently-displayed snapshot, read robustly from EITHER UI form:
+    //   • expanded toggle — the active (purple) button, OR
+    //   • collapsed status pill — a capitalized 'Before'/'After' span that
+    //     Cypress shows once the toggle settles / you stop hovering.
+    // Returns 'before' | 'after' | null.
+    const __currentSnapshot = () => {
+      const active = __snapshotButtons().find(__snapshotActive);
+      if (active) return active.innerText.trim().toLowerCase();
+      const pill = [...document.querySelectorAll('span')].find((n) => {
+        const t = (n.innerText || '').trim().toLowerCase();
+        return (t === 'before' || t === 'after') && n.children.length === 0 && /capitalize/.test((n.className || '').toString());
+      });
+      return pill ? pill.innerText.trim().toLowerCase() : null;
+    };
+    const __selectSnapshot = async (which) => {
+      // Wait for the toggle to appear AND for a snapshot to settle (a default
+      // becomes current). Acting during the transient "nothing active" window,
+      // or with hover-style pointer events, desyncs the pinned snapshot.
+      let btns = __snapshotButtons();
+      const deadline = Date.now() + 2500;
+      while (Date.now() < deadline) {
+        btns = __snapshotButtons();
+        if (btns.length >= 2 && __currentSnapshot()) break; // settled
+        await __sleep(80);
+      }
+      if (btns.length < 2) return { ok: false, reason: 'No before/after toggle present — this command captured a single snapshot.', current: __currentSnapshot() };
+      const wasAlreadyActive = __currentSnapshot() === which;
+      if (!wasAlreadyActive) {
+        const btn = btns.find((b) => (b.innerText || '').trim().toLowerCase() === which);
+        if (!btn) return { ok: false, reason: 'No "' + which + '" snapshot button found.', current: __currentSnapshot() };
+        // Native click only — pointer/hover events trigger the reporter's
+        // hover-preview and desync the pin.
+        btn.click();
+        const settle = Date.now() + 1500;
+        while (Date.now() < settle) { if (__currentSnapshot() === which) break; await __sleep(80); }
+      }
+      const current = __currentSnapshot();
+      return { ok: current === which, selected: which, wasAlreadyActive, current };
+    };
+`;
+
 // Returns spec, current/last test, totals, first-failure summary. One-call orientation.
 const OVERVIEW = `(() => {
   try {
@@ -97,8 +227,10 @@ const FAILURES = `(() => {
       const errEl = el.querySelector('.runnable-err-message, [class*="runnable-err-message"]');
       const stackEl = el.querySelector('.runnable-err-stack-trace, [class*="runnable-err-stack"]');
       const codeFrameEl = el.querySelector('.runnable-err-code-frame, [class*="code-frame"]');
-      // Locate the failed command's DOM index in this test panel.
-      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      // Locate the failed command's DOM index in this test panel. EXACT
+      // '.command-wrapper' so relatedCommandIndex aligns with the indices used by
+      // step_to / get_test_commands (which select the same exact class).
+      const wrappers = [...el.querySelectorAll('.command-wrapper')];
       let relatedCommandIndex = null;
       let relatedCommandNumber = null;
       let relatedCommandText = null;
@@ -154,50 +286,59 @@ const LIST_TESTS = `(() => {
 // Commands logged for the test at reporter index. Reads the rendered DOM
 // (works for finished tests; for the currently running test, Cypress.cy.queue
 // is also available via getLiveCommands).
-function commandsForTestExpr(testIndex, { full = false, argMaxBytes = 240, textMaxBytes = 300 } = {}) {
-  return `(() => {
+function commandsForTestExpr(testIndex, { full = false, bodyOnly = false, argMaxBytes = 240, textMaxBytes = 300 } = {}) {
+  return `(async () => {
     try {
-      const all = [...document.querySelectorAll('.test.runnable')];
+      ${REPORTER_DOM_HELPERS}
+      const all = __testEls();
       const el = all[${testIndex}];
       if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
-      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      await __ensureOpen(el, 3000);
+      const wrappers = __wrappers(el);
+      const bodyOnly = ${bodyOnly};
       const seenNumbers = new Map(); // displayed reporter number -> first DOM index
-      const cmds = wrappers.map((w, i) => {
+      const cmds = [];
+      let hiddenNoise = 0;
+      wrappers.forEach((w, i) => {
         const cls = w.className || '';
         const stateMatch = cls.match(/command-state-(\\w+)/);
+        const state = stateMatch ? stateMatch[1] : null;
         const nameEl = w.querySelector('.command-method, [class*="command-method"]');
+        const name = nameEl ? nameEl.innerText.trim() : null;
+        // bodyOnly hides auto-logged network/resource rows, but never a failed one.
+        if (bodyOnly && __isNoiseCommand(name) && state !== 'failed') { hiddenNoise++; return; }
         const argEl = w.querySelector('.command-message, [class*="command-message"]');
         const numEl = w.querySelector('.command-number, [class*="command-number"]');
         const number = numEl ? numEl.innerText.trim() : null;
         const argRaw = argEl ? argEl.innerText.trim() : null;
         const textRaw = w.innerText.trim();
-        const argTrunc = ${full ? 'false' : true};
-        const out = {
+        cmds.push({
           index: i,
           number,
-          name: nameEl ? nameEl.innerText.trim() : null,
+          name,
           arg: argRaw == null ? null : (${full} ? argRaw : argRaw.slice(0, ${argMaxBytes})),
           argTruncated: !${full} && !!argRaw && argRaw.length > ${argMaxBytes},
           argLength: argRaw == null ? 0 : argRaw.length,
-          state: stateMatch ? stateMatch[1] : null,
+          state,
           text: ${full} ? textRaw : textRaw.slice(0, ${textMaxBytes}),
           textTruncated: !${full} && textRaw.length > ${textMaxBytes},
-        };
+        });
         if (number && !seenNumbers.has(number)) seenNumbers.set(number, i);
-        return out;
       });
       const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
       // Cypress renders one logical "command N" as multiple wrapper rows (parent + children).
       // Provide a map so callers can quickly resolve displayed number -> first DOM index.
       const numberToIndex = {};
       for (const [n, i] of seenNumbers.entries()) numberToIndex[n] = i;
-      return {
+      const out = {
         testTitle: titleEl ? titleEl.innerText.split('\\n')[0].trim() : null,
         commandCount: cmds.length,
         uniqueCommandNumbers: seenNumbers.size,
         numberToIndex,
         commands: cmds,
       };
+      if (bodyOnly && hiddenNoise > 0) out.hiddenNoiseRows = hiddenNoise;
+      return out;
     } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
   })()`;
 }
@@ -268,48 +409,77 @@ const LIVE_COMMANDS = liveCommandsExpr({ summarize: false });
 // Click on a specific command in a specific test panel to time-travel. Caller
 // may pass either commandIndex (raw DOM position 0..N) OR commandNumber (the
 // displayed reporter number, e.g. "38"). When both are given commandNumber wins.
-function stepToExpr(testIndex, { commandIndex, commandNumber } = {}) {
-  return `(() => {
-    const all = [...document.querySelectorAll('.test.runnable')];
-    const el = all[${testIndex}];
-    if (!el) return { ok: false, reason: 'No test at index ${testIndex}', total: all.length };
-    const header = el.querySelector(':scope > .collapsible-header-wrapper');
-    const expanded = el.classList.contains('is-open');
-    if (header && !expanded) header.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
-    let target = null;
-    let resolvedFrom = null;
-    const wantNumber = ${commandNumber == null ? 'null' : JSON.stringify(String(commandNumber))};
-    const wantIndex = ${commandIndex == null ? 'null' : Number(commandIndex)};
-    if (wantNumber != null) {
-      target = wrappers.find((w) => {
-        const n = w.querySelector('.command-number, [class*="command-number"]');
-        return n && n.innerText.trim() === wantNumber;
-      });
-      resolvedFrom = 'commandNumber';
-    }
-    if (!target && wantIndex != null) {
-      target = wrappers[wantIndex];
-      resolvedFrom = 'commandIndex';
-    }
-    if (!target) return {
-      ok: false,
-      reason: 'No command found by commandNumber=' + wantNumber + ' / commandIndex=' + wantIndex,
-      total: wrappers.length,
-    };
-    target.scrollIntoView({ block: 'center' });
-    ['mouseover','mousedown','mouseup','click'].forEach(t =>
-      target.dispatchEvent(new MouseEvent(t, { bubbles: true }))
-    );
-    const numEl = target.querySelector('.command-number, [class*="command-number"]');
-    return {
-      ok: true,
-      testIndex: ${testIndex},
-      resolvedFrom,
-      pinnedNumber: numEl ? numEl.innerText.trim() : null,
-      pinnedIndex: wrappers.indexOf(target),
-      text: target.innerText.trim().slice(0, 240),
-    };
+// Opens the panel and waits for its virtualized rows first, clicks the real pin
+// target (`.command-wrapper-container`), then polls to confirm the pin landed.
+function stepToExpr(testIndex, { commandIndex, commandNumber, snapshot } = {}) {
+  return `(async () => {
+    try {
+      ${REPORTER_DOM_HELPERS}
+      const all = __testEls();
+      const el = all[${testIndex}];
+      if (!el) return { ok: false, reason: 'No test at index ${testIndex}', total: all.length };
+      const opened = await __ensureOpen(el, 3000);
+      const wrappers = __wrappers(el);
+      if (wrappers.length === 0) return {
+        ok: false,
+        reason: 'Panel opened (open=' + opened.open + ') but has no command rows. The spec likely finished and Cypress garbage-collected this test\\'s log; rerun_spec to get a live panel, or retry if it is still rendering.',
+        open: opened.open,
+      };
+      let target = null;
+      let resolvedFrom = null;
+      const wantNumber = ${commandNumber == null ? 'null' : JSON.stringify(String(commandNumber))};
+      const wantIndex = ${commandIndex == null ? 'null' : Number(commandIndex)};
+      if (wantNumber != null) {
+        target = wrappers.find((w) => __cmdNumber(w) === wantNumber);
+        resolvedFrom = 'commandNumber';
+      }
+      if (!target && wantIndex != null) {
+        target = wrappers[wantIndex];
+        resolvedFrom = 'commandIndex';
+      }
+      if (!target) return {
+        ok: false,
+        reason: 'No command found by commandNumber=' + wantNumber + ' / commandIndex=' + wantIndex,
+        total: wrappers.length,
+        availableNumbers: [...new Set(wrappers.map(__cmdNumber).filter(Boolean))].slice(0, 60),
+      };
+      // Re-clicking an ALREADY-pinned command toggles it OFF (un-pins). When the
+      // target is already the pinned one (e.g. a second step_to on the same
+      // command to switch snapshot), skip the pin click and go straight to the
+      // snapshot selection.
+      const alreadyPinned = /command-is-pinned/.test(target.className || '') || !!target.querySelector('.command-is-pinned');
+      let pinned = __pinnedEl();
+      if (!alreadyPinned) {
+        const pinNode = __pinTarget(target);
+        pinNode.scrollIntoView({ block: 'center' });
+        __click(pinNode); // native click only — no hover events (avoids snapshot auto-cycle)
+        // Pinning re-renders asynchronously — poll until a pinned row appears.
+        pinned = null;
+        const deadline = Date.now() + 1500;
+        while (Date.now() < deadline) { pinned = __pinnedEl(); if (pinned) break; await __sleep(50); }
+      }
+      // Optionally select the before/after snapshot for this command.
+      const wantSnapshot = ${snapshot ? JSON.stringify(String(snapshot)) : 'null'};
+      let snapshotResult = null;
+      if (wantSnapshot && pinned) snapshotResult = await __selectSnapshot(wantSnapshot);
+      // Defensive: ensure no synthetic hover lingers to flicker the snapshot.
+      __clearHover();
+      const numEl = target.querySelector('.command-number, [class*="command-number"]');
+      return {
+        ok: true,
+        testIndex: ${testIndex},
+        resolvedFrom,
+        pinned: !!pinned,
+        pinnedNumber: numEl ? numEl.innerText.trim() : null,
+        pinnedIndex: wrappers.indexOf(target),
+        name: __cmdMethod(target),
+        text: target.innerText.trim().slice(0, 240),
+        snapshot: snapshotResult,
+        hint: pinned
+          ? 'AUT is now time-traveled to this command. Read it with get_dom / screenshot { kind: "aut" } / find_in_aut.'
+          : 'Click dispatched but no pinned row detected yet — the snapshot may still be applying; verify with get_pinned_command.',
+      };
+    } catch (e) { return { ok: false, error: String(e && e.stack || e && e.message || e) }; }
   })()`;
 }
 
@@ -406,26 +576,27 @@ const AUT_INFO = `(() => {
   };
 })()`;
 
-// Expand a test panel (the .collapsible-header-wrapper toggles open).
+// Expand a test panel and wait for its (virtualized) command rows to render.
+// Detects open-state on the `.collapsible` child and clicks the real header, so
+// it never accidentally toggles an already-open panel shut.
 function expandTestExpr(testIndex) {
-  return `(() => {
-    const all = [...document.querySelectorAll('.test.runnable')];
-    const el = all[${testIndex}];
-    if (!el) return { ok: false, reason: 'No test at index ${testIndex}', total: all.length };
-    const wasOpen = el.classList.contains('is-open');
-    if (!wasOpen) {
-      const header = el.querySelector(':scope > .collapsible-header-wrapper');
-      if (header) header.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    }
-    el.scrollIntoView({ block: 'center' });
-    return { ok: true, wasAlreadyOpen: wasOpen, index: ${testIndex} };
+  return `(async () => {
+    try {
+      ${REPORTER_DOM_HELPERS}
+      const all = __testEls();
+      const el = all[${testIndex}];
+      if (!el) return { ok: false, reason: 'No test at index ${testIndex}', total: all.length };
+      const wasOpen = __isOpen(el);
+      const res = await __ensureOpen(el, 3000);
+      return { ok: true, wasAlreadyOpen: wasOpen, isOpen: res.open, commandRowCount: res.rows, index: ${testIndex} };
+    } catch (e) { return { ok: false, error: String(e && e.stack || e && e.message || e) }; }
   })()`;
 }
 
 // Which command is currently pinned (i.e. has command-state-pinned or
 // .command-pinned class). Useful after step_to to verify the snapshot.
 const PINNED_COMMAND = `(() => {
-  const pinned = document.querySelector('[class*="command-pinned"], .command-wrapper.is-pinned, .command-wrapper.command-pinned');
+  const pinned = document.querySelector('.command-is-pinned, .command-wrapper.command-is-pinned, [class*="command-is-pinned"], [class*="command-pinned"], .command-wrapper.is-pinned');
   if (!pinned) return null;
   const nameEl = pinned.querySelector('.command-method, [class*="command-method"]');
   const argEl = pinned.querySelector('.command-message, [class*="command-message"]');
@@ -450,7 +621,7 @@ const REPORTER_WARNINGS = `(() => {
     allTests.forEach((testEl, testIndex) => {
       const titleEl = testEl.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
       const testTitle = titleEl ? titleEl.innerText.split('\\n')[0].trim() : null;
-      const wrappers = testEl.querySelectorAll('.command-wrapper, [class*="command-wrapper"]');
+      const wrappers = testEl.querySelectorAll('.command-wrapper');
       wrappers.forEach((w) => {
         const text = (w.innerText || '').trim();
         if (!/WARNING:/i.test(text)) return;
@@ -478,42 +649,65 @@ const AUT_RECT = `(() => {
 // Compact commands view — one row per UNIQUE command number with state +
 // name + truncated arg. Designed for triage: an agent can scan 200 commands
 // in a few KB instead of the 70K+ that the full wrapper view costs.
-function commandsSummaryForTestExpr(testIndex) {
-  return `(() => {
+function commandsSummaryForTestExpr(testIndex, { bodyOnly = true } = {}) {
+  return `(async () => {
     try {
-      const all = [...document.querySelectorAll('.test.runnable')];
+      ${REPORTER_DOM_HELPERS}
+      const all = __testEls();
       const el = all[${testIndex}];
       if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
-      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
-      const byNumber = new Map();
+      await __ensureOpen(el, 3000);
+      const wrappers = __wrappers(el);
+      const bodyOnly = ${bodyOnly};
+      // Emit one row per meaningful command. NUMBERED commands (Cypress parent
+      // commands) are deduped to their first wrapper row. UNNUMBERED rows --
+      // chained child commands like -click / -assert and system rows like
+      // (new url) / (fetch) -- are kept individually: they carry no gutter
+      // number, so the only way to time-travel to them is via their DOM index
+      // with step_to { commandIndex }. The previous summary dropped them, which
+      // hid exactly the command a developer pins by hand.
+      const seenNumbers = new Set();
+      const commands = [];
+      let hiddenNoise = 0;
       wrappers.forEach((w, i) => {
+        const nameEl = w.querySelector('.command-method, [class*="command-method"]');
+        const name = nameEl ? nameEl.innerText.trim() : null;
         const numEl = w.querySelector('.command-number, [class*="command-number"]');
-        const number = numEl ? numEl.innerText.trim() : '';
-        if (!number || byNumber.has(number)) return;
+        const number = numEl && numEl.innerText.trim() ? numEl.innerText.trim() : null;
+        if (!name && !number) return; // skip structural/noise wrappers
+        if (number != null) { if (seenNumbers.has(number)) return; seenNumbers.add(number); }
+        // bodyOnly hides auto-logged network/resource rows (but never a failed
+        // one — a failing xhr/request is exactly what you want to see).
         const cls = w.className || '';
         const stateMatch = cls.match(/command-state-(\\w+)/);
-        const nameEl = w.querySelector('.command-method, [class*="command-method"]');
+        const state = stateMatch ? stateMatch[1] : null;
+        if (bodyOnly && __isNoiseCommand(name) && state !== 'failed') { hiddenNoise++; return; }
+        const typeMatch = cls.match(/command-type-(\\w+)/);
         const argEl = w.querySelector('.command-message, [class*="command-message"]');
         const argRaw = argEl ? argEl.innerText.trim() : null;
-        byNumber.set(number, {
-          number,
-          index: i,
-          name: nameEl ? nameEl.innerText.trim() : null,
+        commands.push({
+          index: i,                 // DOM position — use with step_to { commandIndex }
+          number,                   // null for child / system commands
+          name,
           arg: argRaw == null ? null : argRaw.slice(0, 80),
           argLength: argRaw == null ? 0 : argRaw.length,
-          state: stateMatch ? stateMatch[1] : null,
+          state,
+          type: typeMatch ? typeMatch[1] : null,
         });
       });
       const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
-      const commands = [...byNumber.values()];
-      const failedIdx = commands.findIndex((c) => c.state === 'failed');
-      return {
+      const failed = commands.find((c) => c.state === 'failed');
+      const out = {
         testTitle: titleEl ? titleEl.innerText.split('\\n')[0].trim() : null,
         wrapperRowCount: wrappers.length,
         commandCount: commands.length,
-        firstFailedNumber: failedIdx >= 0 ? commands[failedIdx].number : null,
+        firstFailedNumber: failed ? failed.number : null,
+        firstFailedIndex: failed ? failed.index : null,
         commands,
       };
+      if (bodyOnly && hiddenNoise > 0) out.hiddenNoiseRows = hiddenNoise;
+      if (bodyOnly && hiddenNoise > 0) out._note = hiddenNoise + ' auto-logged network/resource rows hidden. Pass bodyOnly:false to include them, or use get_network_logs.';
+      return out;
     } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
   })()`;
 }
@@ -521,12 +715,14 @@ function commandsSummaryForTestExpr(testIndex) {
 // Paged version of commandsForTestExpr — returns wrappers[start .. start+size].
 function commandsPagedForTestExpr(testIndex, { page = 0, pageSize = 50, full = false, argMaxBytes = 240, textMaxBytes = 300 } = {}) {
   const start = page * pageSize;
-  return `(() => {
+  return `(async () => {
     try {
-      const all = [...document.querySelectorAll('.test.runnable')];
+      ${REPORTER_DOM_HELPERS}
+      const all = __testEls();
       const el = all[${testIndex}];
       if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
-      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      await __ensureOpen(el, 3000);
+      const wrappers = __wrappers(el);
       const total = wrappers.length;
       const start = ${start};
       const end = Math.min(start + ${pageSize}, total);
@@ -572,12 +768,14 @@ function commandsPagedForTestExpr(testIndex, { page = 0, pageSize = 50, full = f
 //   • mode='wrappers' — raw DOM-row counting. Use only if you need exact
 //     wrapper rows (e.g. for parent-row vs child-row diagnostics).
 function commandsAroundExpr(testIndex, anchor, before = 5, after = 5, { argMaxBytes = 240, textMaxBytes = 300, mode = 'logical' } = {}) {
-  return `(() => {
+  return `(async () => {
     try {
-      const all = [...document.querySelectorAll('.test.runnable')];
+      ${REPORTER_DOM_HELPERS}
+      const all = __testEls();
       const el = all[${testIndex}];
       if (!el) return { error: 'No test at index ${testIndex}', total: all.length };
-      const wrappers = [...el.querySelectorAll('.command-wrapper, [class*="command-wrapper"]')];
+      await __ensureOpen(el, 3000);
+      const wrappers = __wrappers(el);
       const anchor = ${anchor};
       const before = ${before};
       const after = ${after};

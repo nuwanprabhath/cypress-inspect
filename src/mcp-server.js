@@ -266,15 +266,16 @@ async function runMcp() {
     'get_test_commands',
     {
       title: 'Get commands logged for a specific test',
-      description: '⚠ **For most cases prefer `get_test_commands_summary` first** — for complex tests this tool can return 50+ KB which overflows the agent\'s per-tool-result budget. Use `get_test_commands_summary` to triage, then `get_test_commands_page` for a specific window.\n\nReturns the rendered command list for the test at `index` (use `list_tests` to find it). Each entry has `number` (reporter-displayed number, NOT unique across rows — Cypress renders one logical command as 2-3 wrapper rows for parent+children), `index` (raw DOM position, unique), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength` so you can tell when content was cut. Set `full: true` to return untruncated args + text (heavier payload — use when the error message is buried in a log row\'s arg). The result also includes `numberToIndex` mapping for quickly resolving a displayed reporter number to the first DOM index, useful with `step_to { commandNumber }`.\n\nFinished-spec caveat: Cypress garbage-collects test panels after a spec completes, so an empty `commands: []` typically means the spec is no longer live. Call mid-run, or trigger `rerun_spec` first.',
+      description: '⚠ **For most cases prefer `get_test_commands_summary` first** — for complex tests this tool can return 50+ KB which overflows the agent\'s per-tool-result budget. Use `get_test_commands_summary` to triage, then `get_test_commands_page` for a specific window.\n\nReturns the rendered command list for the test at `index` (use `list_tests` to find it). Each entry has `number` (reporter-displayed number, NOT unique across rows — Cypress renders one logical command as 2-3 wrapper rows for parent+children), `index` (raw DOM position, unique), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength` so you can tell when content was cut. Set `full: true` to return untruncated args + text (heavier payload — use when the error message is buried in a log row\'s arg). The result also includes `numberToIndex` mapping for quickly resolving a displayed reporter number to the first DOM index, useful with `step_to { commandNumber }`.\n\n`bodyOnly: true` hides auto-logged network/resource rows (`(fetch)`/`(xhr)`/`(image)` etc.; a failed one is always kept) — a fast way to cut a noisy finished-spec panel down to the real cy.* commands.\n\nThe panel is auto-opened and the tool waits for its (virtualized) command rows to render first, so a collapsed test no longer returns empty. An empty `commands: []` that persists means the spec has finished and Cypress garbage-collected the log — trigger `rerun_spec` for a live panel.',
       inputSchema: {
         index: z.number().int().nonnegative(),
         full: z.boolean().optional(),
+        bodyOnly: z.boolean().optional(),
       },
     },
-    async ({ index, full }) => {
+    async ({ index, full, bodyOnly }) => {
       await ensureAttached();
-      const result = await cdp.evalOnRunner(probe.commandsForTestExpr(index, { full: !!full }));
+      const result = await cdp.evalOnRunner(probe.commandsForTestExpr(index, { full: !!full, bodyOnly: !!bodyOnly }));
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -299,13 +300,14 @@ async function runMcp() {
     'get_test_commands_summary',
     {
       title: 'Lightweight command summary (triage view)',
-      description: 'Returns one row per UNIQUE displayed command number — name, arg (≤80 chars), state. Cypress renders one logical command as 2-3 wrapper rows; this view collapses them. Designed for triage on complex tests where `get_test_commands` busts the token budget. Also returns `firstFailedNumber` for fast jumps via `step_to`.\n\nPass EITHER `index` (a specific test) OR `forFirstFailure: true` (skip the `find_test`/`list_tests` step — uses the first failed test in the spec).\n\nFinished-spec caveat: Cypress garbage-collects test panels after a spec completes, so `commandCount: 0` typically means the spec is no longer live. Call mid-run, or run `rerun_spec` first.',
+      description: 'Returns one row per command — `index` (DOM position, use with `step_to { commandIndex }`), `number` (gutter number; null for chained child commands like `-click`/`-assert`), `name`, `arg` (≤80 chars), `state`, `type`. Cypress renders one logical command as 2-3 wrapper rows; this view collapses them. Designed for triage on complex tests where `get_test_commands` busts the token budget. Also returns `firstFailedNumber` + `firstFailedIndex` for fast jumps via `step_to`.\n\nPass EITHER `index` (a specific test) OR `forFirstFailure: true` (skip the `find_test`/`list_tests` step — uses the first failed test in the spec).\n\n`bodyOnly` (default **true**) hides auto-logged network/resource rows — `(fetch)`/`(xhr)`/`(image)` heartbeats etc. that can be 10x the real commands on a finished spec — while always keeping a failed one. When any are hidden the result carries `hiddenNoiseRows` + a `_note`. Set `bodyOnly: false` to see them, or use `get_network_logs`.\n\nThe panel is auto-opened and the tool waits for its (virtualized) command rows to render before reading, so a collapsed test no longer returns empty. If `commandCount: 0` persists, the spec has finished and Cypress has genuinely garbage-collected the log — run `rerun_spec` to get a live panel.',
       inputSchema: {
         index: z.number().int().nonnegative().optional(),
         forFirstFailure: z.boolean().optional(),
+        bodyOnly: z.boolean().optional(),
       },
     },
-    async ({ index, forFirstFailure } = {}) => {
+    async ({ index, forFirstFailure, bodyOnly } = {}) => {
       await ensureAttached();
       let resolvedIndex = index;
       if (resolvedIndex == null) {
@@ -316,9 +318,9 @@ async function runMcp() {
         if (!firstFailed) return textResult('No failed tests in the spec.');
         resolvedIndex = firstFailed.index;
       }
-      const result = await cdp.evalOnRunner(probe.commandsSummaryForTestExpr(resolvedIndex));
+      const result = await cdp.evalOnRunner(probe.commandsSummaryForTestExpr(resolvedIndex, { bodyOnly: bodyOnly !== false }));
       if (result && result.commandCount === 0 && !result.error) {
-        result._warning = 'commandCount is 0 — Cypress may have garbage-collected the panel (typical after spec completion). Call mid-run or trigger `rerun_spec` first.';
+        result._warning = 'commandCount is 0 even after auto-opening the panel and waiting for rows. The spec has likely finished and Cypress garbage-collected this test\'s command log — run `rerun_spec` to get a live panel.';
       }
       if (result && resolvedIndex !== index) result._resolvedFrom = 'forFirstFailure';
       return textResult(JSON.stringify(result, null, 2));
@@ -400,7 +402,7 @@ async function runMcp() {
     'expand_test',
     {
       title: 'Expand a test panel',
-      description: 'Open the collapsible panel for the test at `index` so its commands and error block are visible in the reporter. Scrolls the panel into view. `step_to` already does this implicitly; use this when you just want to read commands without time-travelling.',
+      description: 'Open the collapsible panel for the test at `index` so its commands and error block are visible in the reporter, scroll it into view, and wait for the (virtualized) command rows to render. Returns `{ wasAlreadyOpen, isOpen, commandRowCount }`. Correctly leaves an already-open panel open (never toggles it shut). `step_to` and the `get_test_commands*` tools already do this implicitly; use this when you just want to surface a panel without time-travelling.',
       inputSchema: { index: z.number().int().nonnegative() },
     },
     async ({ index }) => {
@@ -414,7 +416,7 @@ async function runMcp() {
     'get_pinned_command',
     {
       title: 'Get the currently-pinned command',
-      description: 'After `step_to`, returns which command is currently pinned (driving the AUT snapshot). Returns null if nothing is pinned.',
+      description: 'After `step_to`, returns which command is currently pinned (driving the AUT snapshot): `{ number, name, arg, text }`. Returns null if nothing is pinned. Matches the reporter\'s `command-is-pinned` row.',
       inputSchema: {},
     },
     async () => {
@@ -428,15 +430,16 @@ async function runMcp() {
     'step_to',
     {
       title: 'Time-travel: pin to a command in a specific test',
-      description: 'Restore the AUT to the state at one command (same as clicking in the Cypress sidebar). Expands the test panel first if collapsed. Three ways to specify the target:\n  • `failureIndex` — position in the `get_failures` array. Auto-resolves to the test\'s failing command. Shortest path from `get_failures` to a pinned snapshot.\n  • `testIndex` + `commandNumber` — the displayed reporter number (e.g. 38). Matches what humans see.\n  • `testIndex` + `commandIndex` — raw DOM position 0..N. Use to disambiguate duplicate reporter numbers (Cypress renders parent + child rows separately).\nIf both `commandNumber` and `commandIndex` are given, `commandNumber` wins. After this, `get_dom` / `screenshot { kind: "aut" }` / `get_pinned_command` reflect the pinned step.',
+      description: 'Restore the AUT to the state at one command (same as clicking a command in the Cypress sidebar) — this is the core time-travel tool. Auto-opens the test panel, waits for its virtualized command rows to render, clicks the real pin target, then confirms the pin landed (`pinned: true` in the result). Three ways to specify the target:\n  • `failureIndex` — position in the `get_failures` array. Auto-resolves to the test\'s failing command. Shortest path from `get_failures` to a pinned snapshot.\n  • `testIndex` + `commandNumber` — the displayed reporter number (e.g. 38). Matches what humans see.\n  • `testIndex` + `commandIndex` — raw DOM position 0..N. Use to disambiguate duplicate reporter numbers (Cypress renders parent + child rows separately). Child commands like `-click`/`-assert` carry NO number — find their `index` via `get_test_commands_summary` and pass it here.\nIf both `commandNumber` and `commandIndex` are given, `commandNumber` wins.\n\n`snapshot`: for a command that captured both states (e.g. a click that navigated), pass `"before"` or `"after"` to choose which snapshot the AUT shows. The result\'s `snapshot` field reports `{ ok, selected, wasAlreadyActive, active }`, or `{ ok: false, reason }` when the command has only one snapshot. Use `"before"` to inspect the app state the command acted on (the common debugging case).\n\nAfter this, `get_dom` / `screenshot { kind: "aut" }` / `find_in_aut` / `get_pinned_command` all reflect the pinned step. If the panel has no rows (`ok: false`), the spec finished and Cypress GC\'d the log — `rerun_spec` for a live panel.',
       inputSchema: {
         failureIndex: z.number().int().nonnegative().optional(),
         testIndex: z.number().int().nonnegative().optional(),
         commandIndex: z.number().int().nonnegative().optional(),
         commandNumber: z.union([z.number().int().nonnegative(), z.string()]).optional(),
+        snapshot: z.enum(['before', 'after']).optional(),
       },
     },
-    async ({ failureIndex, testIndex, commandIndex, commandNumber }) => {
+    async ({ failureIndex, testIndex, commandIndex, commandNumber, snapshot }) => {
       await ensureAttached();
       let tIdx = testIndex;
       let cIdx = commandIndex;
@@ -455,7 +458,7 @@ async function runMcp() {
       }
       if (tIdx == null) return textResult('Provide either failureIndex OR testIndex (with commandNumber / commandIndex).');
       if (cIdx == null && cNum == null) return textResult('Provide commandNumber or commandIndex (or use failureIndex to auto-resolve).');
-      const result = await cdp.evalOnRunner(probe.stepToExpr(tIdx, { commandIndex: cIdx, commandNumber: cNum }));
+      const result = await cdp.evalOnRunner(probe.stepToExpr(tIdx, { commandIndex: cIdx, commandNumber: cNum, snapshot }));
       if (resolvedFromFailureIndex) result._resolvedFromFailureIndex = failureIndex;
       return textResult(JSON.stringify(result, null, 2));
     },
