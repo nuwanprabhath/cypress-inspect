@@ -449,14 +449,20 @@ function stepToExpr(testIndex, { commandIndex, commandNumber, snapshot } = {}) {
       // snapshot selection.
       const alreadyPinned = /command-is-pinned/.test(target.className || '') || !!target.querySelector('.command-is-pinned');
       let pinned = __pinnedEl();
+      let pinAttempts = 0;
       if (!alreadyPinned) {
+        // Click, then poll for the pin to register. If it doesn't land, retry the
+        // click a couple of times — the first synthetic click can race the
+        // reporter's async re-render and silently no-op.
         const pinNode = __pinTarget(target);
         pinNode.scrollIntoView({ block: 'center' });
-        __click(pinNode); // native click only — no hover events (avoids snapshot auto-cycle)
-        // Pinning re-renders asynchronously — poll until a pinned row appears.
-        pinned = null;
-        const deadline = Date.now() + 1500;
-        while (Date.now() < deadline) { pinned = __pinnedEl(); if (pinned) break; await __sleep(50); }
+        for (pinAttempts = 1; pinAttempts <= 3; pinAttempts++) {
+          __click(pinNode); // native click only — no hover events (avoids snapshot auto-cycle)
+          pinned = null;
+          const deadline = Date.now() + 1200;
+          while (Date.now() < deadline) { pinned = __pinnedEl(); if (pinned) break; await __sleep(50); }
+          if (pinned) break;
+        }
       }
       // Optionally select the before/after snapshot for this command.
       const wantSnapshot = ${snapshot ? JSON.stringify(String(snapshot)) : 'null'};
@@ -470,6 +476,7 @@ function stepToExpr(testIndex, { commandIndex, commandNumber, snapshot } = {}) {
         testIndex: ${testIndex},
         resolvedFrom,
         pinned: !!pinned,
+        pinAttempts: alreadyPinned ? 0 : pinAttempts,
         pinnedNumber: numEl ? numEl.innerText.trim() : null,
         pinnedIndex: wrappers.indexOf(target),
         name: __cmdMethod(target),
@@ -477,7 +484,7 @@ function stepToExpr(testIndex, { commandIndex, commandNumber, snapshot } = {}) {
         snapshot: snapshotResult,
         hint: pinned
           ? 'AUT is now time-traveled to this command. Read it with get_dom / screenshot { kind: "aut" } / find_in_aut.'
-          : 'Click dispatched but no pinned row detected yet — the snapshot may still be applying; verify with get_pinned_command.',
+          : 'Pin did not register after ' + pinAttempts + ' attempts. The command may not be pinnable (no snapshot), or the panel re-rendered — retry step_to, or rerun_spec if the spec has finished.',
       };
     } catch (e) { return { ok: false, error: String(e && e.stack || e && e.message || e) }; }
   })()`;
@@ -562,6 +569,49 @@ function findInAutExpr(selector, limit, { textOnly = false, textMaxBytes = 240 }
   })()`;
 }
 
+// Read the value of a form field (honors the pinned snapshot, since it reads the
+// AUT DOM). Resolves the field by `data-cy` (preferred) or a raw CSS selector,
+// and bundles the values that are otherwise fiddly to extract — especially for
+// Quasar q-select where the shown value lives in a sibling span, not the input.
+// Returns { found, displayText, inputValue, disabled, tag, role }.
+function findFieldExpr({ dataCy = null, selector = null } = {}) {
+  const sel = dataCy
+    ? `[data-cy=${JSON.stringify(dataCy)}]`
+    : (selector || '');
+  return `(() => {
+    try {
+      const aut = document.querySelector('iframe.aut-iframe');
+      if (!aut || !aut.contentDocument) return { error: 'AUT iframe not found' };
+      const doc = aut.contentDocument;
+      const root = doc.querySelector(${JSON.stringify(sel)});
+      if (!root) return { found: false, selector: ${JSON.stringify(sel)} };
+      // The <input>/<select>/<textarea> — either the element itself or nested.
+      const input = (root.matches && root.matches('input,select,textarea')) ? root : root.querySelector('input, select, textarea');
+      // Quasar q-select renders the chosen label in .q-field__native / a span,
+      // not the input. Prefer that for displayText; fall back to root text.
+      const native = root.querySelector('.q-field__native, [class*="field__native"]');
+      const displaySrc = native || root;
+      const displayText = (displaySrc.innerText || displaySrc.textContent || '').trim();
+      const cls = (root.className || '').toString();
+      const ariaDisabled = root.getAttribute && root.getAttribute('aria-disabled');
+      const disabled = !!(input && input.disabled) || ariaDisabled === 'true' || /q-field--disabled|disabled/.test(cls);
+      return {
+        found: true,
+        selector: ${JSON.stringify(sel)},
+        tag: root.tagName.toLowerCase(),
+        role: root.getAttribute ? root.getAttribute('role') : null,
+        displayText: displayText.slice(0, 240),
+        inputValue: input ? (input.value === undefined ? null : String(input.value).slice(0, 240)) : null,
+        inputType: input ? (input.getAttribute('type') || input.tagName.toLowerCase()) : null,
+        disabled,
+        ariaExpanded: root.getAttribute ? root.getAttribute('aria-expanded') : null,
+        visible: !!(root.offsetWidth || root.offsetHeight || root.getClientRects().length),
+        _note: 'DOM-derived (honors step_to). Vue/Pinia modelValue is JS heap = live-only; not available at a pinned snapshot.',
+      };
+    } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
+  })()`;
+}
+
 // Current URL of the AUT and a few useful globals.
 const AUT_INFO = `(() => {
   const aut = document.querySelector('iframe.aut-iframe');
@@ -574,6 +624,41 @@ const AUT_INFO = `(() => {
     readyState: aut.contentDocument.readyState,
     online: w && typeof w.navigator !== 'undefined' ? w.navigator.onLine : null,
   };
+})()`;
+
+// AUT clock + timezone, and whether cy.clock() has frozen/installed a fake timer.
+// Date/timezone off-by-one bugs are a classic Cypress flake class; this surfaces
+// the inputs (now, tz offset) so an agent doesn't have to do date math via eval.
+const AUT_CLOCK = `(() => {
+  const aut = document.querySelector('iframe.aut-iframe');
+  const w = aut && aut.contentWindow ? aut.contentWindow : window;
+  try {
+    const now = new Date();
+    // cy.clock() replaces window.Date / setTimeout in the AUT with sinon fakes.
+    // Detect it: faked timers expose a 'clock' marker, and Date is wrapped.
+    const C = (window.Cypress) || (w && w.Cypress);
+    let clockFrozen = false;
+    let clockNow = null;
+    try {
+      const fake = (w && w.__clock) || (C && C.state && C.state('clock')) || null;
+      if (fake) {
+        clockFrozen = true;
+        clockNow = (typeof fake.now === 'number') ? fake.now : (fake.now && fake.now.getTime ? fake.now.getTime() : null);
+      }
+    } catch (e) {}
+    // Heuristic fallback: a sinon-faked Date has a 'clock' backref or isFake flag.
+    if (!clockFrozen && w && w.Date && (w.Date.isFake || w.Date.clock)) clockFrozen = true;
+    return {
+      nowISO: now.toISOString(),
+      nowEpochMs: now.getTime(),
+      timezoneOffsetMin: now.getTimezoneOffset(),
+      resolvedTimeZone: (Intl && Intl.DateTimeFormat) ? Intl.DateTimeFormat().resolvedOptions().timeZone : null,
+      autTimezoneOffsetMin: (w && w.Date) ? (new w.Date()).getTimezoneOffset() : null,
+      clockFrozen,
+      clockNowEpochMs: clockNow,
+      clockNowISO: clockNow != null ? new Date(clockNow).toISOString() : null,
+    };
+  } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
 })()`;
 
 // Expand a test panel and wait for its (virtualized) command rows to render.
@@ -933,6 +1018,39 @@ function clearAppStateExpr({ skipDatabases = [], skipLocalStorage = false, skipS
   })()`;
 }
 
+// Read-only: report exactly what clear_app_state WOULD wipe, without touching
+// anything. Flags IndexedDB databases that look "load-bearing" (hold synced /
+// seeded data a spec may read without re-seeding) so an agent can skip them via
+// skipDatabases instead of breaking the next run by discovering it the hard way.
+const INSPECT_APP_STATE = `(async () => {
+  try {
+    const aut = document.querySelector('iframe.aut-iframe');
+    const w = (aut && aut.contentWindow) || window;
+    const d = (aut && aut.contentDocument) || document;
+    // Names suggesting persisted/synced data that specs often depend on.
+    const LOAD_BEARING = /auth|apimodel|models|cache|dexie|pouch|postcache|sync|seed|offline|deployment|store/i;
+    const out = { localStorageKeys: [], sessionStorageKeys: [], cookieNames: [], databases: [], loadBearingDatabases: [] };
+    try { out.localStorageKeys = Object.keys(w.localStorage || {}); } catch (e) {}
+    try { out.sessionStorageKeys = Object.keys(w.sessionStorage || {}); } catch (e) {}
+    try { out.cookieNames = (d.cookie || '').split(';').map((c) => c.split('=')[0].trim()).filter(Boolean); } catch (e) {}
+    try {
+      if (w.indexedDB && typeof w.indexedDB.databases === 'function') {
+        const dbs = await w.indexedDB.databases();
+        for (const db of dbs) {
+          if (!db.name) continue;
+          const loadBearing = LOAD_BEARING.test(db.name);
+          out.databases.push({ name: db.name, version: db.version, loadBearing });
+          if (loadBearing) out.loadBearingDatabases.push(db.name);
+        }
+      }
+    } catch (e) { out.errors = ['indexedDB: ' + e.message]; }
+    out._note = out.loadBearingDatabases.length
+      ? 'These databases look load-bearing (synced/seed data). If a spec reads them without re-seeding, clearing will cascade-fail it — pass them in skipDatabases.'
+      : 'No obviously load-bearing databases detected, but verify before a destructive clear.';
+    return out;
+  } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
+})()`;
+
 // Back-compat: callers using the constant still get the no-args behaviour.
 const CLEAR_APP_STATE = clearAppStateExpr();
 
@@ -1071,10 +1189,12 @@ module.exports = {
   liveCommandsExpr,
   AUT_RECT,
   AUT_INFO,
+  AUT_CLOCK,
   PINNED_COMMAND,
   REPORTER_WARNINGS,
   STORAGE_SNAPSHOT,
   CLEAR_APP_STATE,
+  INSPECT_APP_STATE,
   RERUN_SPEC,
   commandsForTestExpr,
   commandsSummaryForTestExpr,
@@ -1087,5 +1207,6 @@ module.exports = {
   autDomExpr,
   findTestExpr,
   findInAutExpr,
+  findFieldExpr,
   expandTestExpr,
 };

@@ -3,6 +3,10 @@ const CDP = require('chrome-remote-interface');
 // Ring buffer of recent console messages across all attached targets.
 const MAX_LOGS = 5000;
 const MAX_NET = 2000;
+// Request/response bodies are captured ONLY for error responses (4xx/5xx),
+// truncated to this many bytes. This keeps the common debugging case — "what did
+// the backend reject and why" — one tool call away without bloating the buffer.
+const MAX_BODY_BYTES = 4096;
 
 class CdpClient {
   constructor() {
@@ -141,14 +145,16 @@ class CdpClient {
         });
       });
 
-      // Network capture — we record only the fields useful for debugging
-      // (method, URL, status, mime, duration, failure reason). Body is
-      // deliberately NOT fetched: response bodies can be enormous and would
-      // dominate the ring buffer. Callers wanting a body can use `eval`.
+      // Network capture — we record the fields useful for debugging (method,
+      // URL, status, mime, duration, failure reason). For NON-error responses
+      // bodies are NOT fetched (they can be enormous). For ERROR responses
+      // (4xx/5xx) we capture the request + response body (truncated) so the
+      // "what did the backend reject and why" case is one tool call away.
       Network.requestWillBeSent?.((params) => {
         this.totalNetSeen++;
         const id = params.requestId;
         const r = params.request || {};
+        const post = typeof r.postData === 'string' ? r.postData : null;
         const entry = {
           id,
           ts: Math.round((params.timestamp || 0) * 1000) || Date.now(),
@@ -165,6 +171,12 @@ class CdpClient {
           failed: false,
           failureText: null,
           durationMs: null,
+          // requestBody is kept regardless (POST/PUT payloads are usually small
+          // and are the other half of a backend-rejection story). Truncated.
+          requestBody: post == null ? null : post.slice(0, MAX_BODY_BYTES),
+          requestBodyTruncated: post != null && post.length > MAX_BODY_BYTES,
+          responseBody: null,
+          responseBodyTruncated: false,
         };
         this.pushNet(entry);
       });
@@ -176,6 +188,19 @@ class CdpClient {
         e.mime = response.mimeType;
         e.fromCache = !!response.fromDiskCache;
         if (timestamp && e.ts) e.durationMs = Math.max(0, Math.round(timestamp * 1000) - e.ts);
+      });
+      // For error responses, fetch the response body once the load finishes
+      // (getResponseBody is only valid after loadingFinished). Best-effort.
+      Network.loadingFinished?.(async ({ requestId }) => {
+        const e = this.network.get(requestId);
+        if (!e || e.status == null || e.status < 400) return;
+        try {
+          const { body, base64Encoded } = await Network.getResponseBody({ requestId });
+          if (typeof body === 'string' && !base64Encoded) {
+            e.responseBody = body.slice(0, MAX_BODY_BYTES);
+            e.responseBodyTruncated = body.length > MAX_BODY_BYTES;
+          }
+        } catch { /* body already evicted or unavailable — leave null */ }
       });
       Network.loadingFailed?.(({ requestId, errorText, canceled, blockedReason }) => {
         const e = this.network.get(requestId);
@@ -251,24 +276,27 @@ class CdpClient {
     return all.find((t) => t.info.type === 'page') || all[0];
   }
 
-  async evalOnRunner(expression, opts = {}) {
+  // Run a CDP operation, and if it fails with a transient socket error, rebuild
+  // targets from the CDP /json list and retry once. The underlying WebSocket can
+  // drop mid-spec (Chrome navigates, the launchpad opens a new tab, Chrome
+  // briefly hangs); chrome-remote-interface emits 'disconnect' eventually, but a
+  // call already in flight throws first with one of these signatures. Used by
+  // every interactive CDP call (eval, screenshot) so a single dropped socket
+  // doesn't lose the result of the next tool call.
+  async _withReconnect(fn) {
     try {
-      return await this._evalOnceOnRunner(expression, opts);
+      return await fn();
     } catch (err) {
-      // Auto-reconnect on transient CDP socket failures. The underlying
-      // WebSocket can drop mid-spec (Chrome navigates, the launchpad opens a
-      // new tab, Chrome briefly hangs). chrome-remote-interface emits the
-      // 'disconnect' event eventually, but a concurrent call in flight throws
-      // first with one of these signatures.
       const msg = String((err && err.message) || err);
-      const recoverable = /ECONNREFUSED|WebSocket is not open|not connected|connection closed|connection lost|socket hang up|disconnected|EPIPE/i.test(msg);
+      const recoverable = /ECONNREFUSED|WebSocket is not open|not connected|connection closed|connection lost|socket hang up|disconnected|EPIPE|No CDP target/i.test(msg);
       if (!recoverable) throw err;
-      // Drop any stale targets and rebuild from the CDP /json list.
       try { await this.refreshTargets(); } catch {}
-      // If refreshTargets didn't find a runner the second try will fail with
-      // a clear "No CDP target available" rather than the cryptic socket error.
-      return await this._evalOnceOnRunner(expression, opts);
+      return await fn();
     }
+  }
+
+  async evalOnRunner(expression, opts = {}) {
+    return this._withReconnect(() => this._evalOnceOnRunner(expression, opts));
   }
 
   async _evalOnceOnRunner(expression, { awaitPromise = true, returnByValue = true } = {}) {
@@ -289,13 +317,15 @@ class CdpClient {
   }
 
   async screenshot({ kind = 'runner', clip } = {}) {
-    const target = this.pickRunnerTarget();
-    if (!target) throw new Error('No CDP target available');
-    const { Page } = target.client;
-    const opts = { format: 'png' };
-    if (clip) opts.clip = clip;
-    const res = await Page.captureScreenshot(opts);
-    return res.data;
+    return this._withReconnect(async () => {
+      const target = this.pickRunnerTarget();
+      if (!target) throw new Error('No CDP target available');
+      const { Page } = target.client;
+      const opts = { format: 'png' };
+      if (clip) opts.clip = clip;
+      const res = await Page.captureScreenshot(opts);
+      return res.data;
+    });
   }
 
   listTargets() {

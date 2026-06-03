@@ -597,6 +597,24 @@ async function runMcp() {
   );
 
   server.registerTool(
+    'get_field',
+    {
+      title: 'Read a form field value (Quasar-aware)',
+      description: 'Convenience reader for a single form field — removes the `.text()` vs `.val()` vs sibling-`<span>` guesswork, especially for Quasar `q-select` where the displayed value lives outside the `<input>`. Pass `dataCy` (resolves `[data-cy=...]`) OR a raw `selector`. Returns `{ found, displayText, inputValue, inputType, disabled, role, ariaExpanded, visible }`.\n\nReads the AUT DOM so it **honors `step_to`** (the field value at a pinned snapshot). Note: the Vue/Pinia `modelValue` is JS-heap state and is live-only — not retrievable at a past snapshot (see `eval` caveats); `displayText`/`inputValue` are the snapshot-accurate equivalents.',
+      inputSchema: {
+        dataCy: z.string().optional(),
+        selector: z.string().optional(),
+      },
+    },
+    async ({ dataCy, selector } = {}) => {
+      await ensureAttached();
+      if (!dataCy && !selector) return textResult('Pass either `dataCy` or `selector`.');
+      const result = await cdp.evalOnRunner(probe.findFieldExpr({ dataCy, selector }));
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
     'get_aut_info',
     {
       title: 'Get AUT iframe URL / location / online state',
@@ -623,13 +641,27 @@ async function runMcp() {
     },
   );
 
+  server.registerTool(
+    'get_clock',
+    {
+      title: 'Get AUT clock + timezone (date/flake debugging)',
+      description: 'Returns the app-under-test\'s current time and timezone so you do not have to compute date math by hand via `eval`. Fields: `nowISO`, `nowEpochMs`, `timezoneOffsetMin` (minutes; e.g. -600 for AEST), `resolvedTimeZone` (IANA name), `autTimezoneOffsetMin`, and `cy.clock` state — `clockFrozen` (true when a test installed a fake timer) plus `clockNowEpochMs`/`clockNowISO` for the frozen time. Off-by-one / timezone bugs (e.g. a `deployment_period` that shifts a day) are a classic Cypress flake class; check this first when a date assertion is suspicious.',
+      inputSchema: {},
+    },
+    async () => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.AUT_CLOCK);
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
   // ───────────────────────────── network / storage / control ─────────────────
 
   server.registerTool(
     'get_network_logs',
     {
       title: 'Buffered network requests',
-      description: 'CDP-captured network requests since the MCP server attached. Filters: `grep` (case-insensitive regex on URL), `since` (epoch ms), `statusMin/statusMax`, `failedOnly: true` (shorthand for failed OR status >= 400), `limit` (default 100). Each entry: `{ method, url, status, mime, durationMs, failed, failureText, ts }`. Body content is intentionally NOT captured — use `eval` if you need it.',
+      description: 'CDP-captured network requests since the MCP server attached. Filters: `grep` (case-insensitive regex on URL), `since` (epoch ms), `statusMin/statusMax`, `failedOnly: true` (shorthand for failed OR status >= 400), `limit` (default 100). Each entry: `{ method, url, status, mime, durationMs, failed, failureText, ts, requestBody, responseBody }`.\n\n**Bodies**: `requestBody` (POST/PUT payload) is captured for every request; `responseBody` is captured ONLY for ERROR responses (status >= 400), both truncated to 4 KB (`requestBodyTruncated`/`responseBodyTruncated` flag when cut). So `get_network_logs({ failedOnly: true })` shows the exact 4xx/5xx that triggered a backend rejection AND its response body — the root cause behind a "400 Bad Request" toast — in one call. For a non-error response body, use `eval` with `Network`/fetch.',
       inputSchema: {
         grep: z.string().optional(),
         since: z.number().optional(),
@@ -660,7 +692,12 @@ async function runMcp() {
         const failMark = r.failed ? `FAIL ${r.failureText || ''} ` : '';
         const status = r.status != null ? r.status : '   ';
         const dur = r.durationMs != null ? `${r.durationMs}ms` : '    ';
-        return `[${new Date(r.ts).toISOString().slice(11, 23)}] ${failMark}${status} ${dur} ${r.method || ''} ${r.url}`;
+        let line = `[${new Date(r.ts).toISOString().slice(11, 23)}] ${failMark}${status} ${dur} ${r.method || ''} ${r.url}`;
+        // Surface captured bodies (request always when present; response only on
+        // errors). These are the payload behind a backend rejection.
+        if (r.requestBody) line += `\n    → request: ${r.requestBody}${r.requestBodyTruncated ? ' …[truncated]' : ''}`;
+        if (r.responseBody) line += `\n    ← response: ${r.responseBody}${r.responseBodyTruncated ? ' …[truncated]' : ''}`;
+        return line;
       }).join('\n');
       return textResult(`${header}\n${body}`);
     },
@@ -684,16 +721,21 @@ async function runMcp() {
     'clear_app_state',
     {
       title: 'Clear localStorage / sessionStorage / cookies / IndexedDB (AUT)',
-      description: 'Best-effort wipe of the app-under-test storage: clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database listed by indexedDB.databases(). Returns counts + `databasesSkipped: []`. Pair with `rerun_spec` for a clean-slate re-run. WRITE OPERATION on the app — use deliberately.\n\n⚠ **Some databases hold permission state** that affects subsequent tests in non-obvious ways:\n  • `auth` typically caches permission grants like `permissionStatuses.geolocation: true` — wiping it can break GPS-dependent tests on the next run.\n  • App-specific caches may hold user-role / feature-flag state.\nPass `skipDatabases: ["auth", ...]` to preserve those. Granular flags `skipLocalStorage` / `skipSessionStorage` / `skipCookies` also available.',
+      description: 'Best-effort wipe of the app-under-test storage: clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database listed by indexedDB.databases(). Returns counts + `databasesSkipped: []`. Pair with `rerun_spec` for a clean-slate re-run. WRITE OPERATION on the app — use deliberately.\n\n**`dryRun: true`** — inspect what WOULD be wiped without touching anything: returns `localStorageKeys`, `sessionStorageKeys`, `cookieNames`, and `databases: [{ name, version, loadBearing }]`, plus `loadBearingDatabases` (those whose names suggest synced/seed data a spec may read without re-seeding). **Run this first** before a destructive clear on an unfamiliar spec.\n\n⚠ **Some databases hold permission/seed state** that affects subsequent tests in non-obvious ways:\n  • `auth` typically caches permission grants like `permissionStatuses.geolocation: true` — wiping it can break GPS-dependent tests on the next run.\n  • Synced/cached data DBs (apiModels, dexie, postCache, …) — clearing breaks specs that read already-synced data without re-seeding.\nPass `skipDatabases: ["auth", ...]` to preserve those. Granular flags `skipLocalStorage` / `skipSessionStorage` / `skipCookies` also available.',
       inputSchema: {
+        dryRun: z.boolean().optional(),
         skipDatabases: z.array(z.string()).optional(),
         skipLocalStorage: z.boolean().optional(),
         skipSessionStorage: z.boolean().optional(),
         skipCookies: z.boolean().optional(),
       },
     },
-    async (args = {}) => {
+    async ({ dryRun, ...args } = {}) => {
       await ensureAttached();
+      if (dryRun) {
+        const preview = await cdp.evalOnRunner(probe.INSPECT_APP_STATE);
+        return textResult(JSON.stringify({ dryRun: true, wouldClear: preview }, null, 2));
+      }
       const result = await cdp.evalOnRunner(probe.clearAppStateExpr(args));
       return textResult(JSON.stringify(result, null, 2));
     },
@@ -721,8 +763,9 @@ async function runMcp() {
     'reset_and_rerun',
     {
       title: 'Clear app state + rerun spec (one-shot)',
-      description: 'Safe clear-and-rerun: navigates to the Cypress specs list first (stopping any in-progress run so the app is idle), wipes all app storage, waits for the app to settle, then navigates back to the spec to start a fresh run. This prevents the race condition where clearing cache mid-run causes the app to crash.\n\nSequence: (1) capture current spec file, (2) navigate to specs list, (3) clear localStorage / sessionStorage / cookies / IndexedDB, (4) wait `postClearWaitMs` (default 5000ms) for the app to settle, (5) navigate back to the spec runner (auto-starts the run), (6) verify the run started.\n\nReturns `{ cleared, specFile, postClearWaitMs, actuallyStarted, escalatedToForceReload, attempts }`.\n\n`postClearWaitMs` (default 5000) — how long to wait after clearing before navigating back. Increase for apps that eagerly re-fetch data on startup.\n`skipDatabases` (e.g. `["auth"]`) preserves named IndexedDB databases — useful when wiping `auth` would lose persisted permission grants like `permissionStatuses.geolocation: true` and break GPS-dependent tests.',
+      description: 'Safe clear-and-rerun: navigates to the Cypress specs list first (stopping any in-progress run so the app is idle), wipes all app storage, waits for the app to settle, then navigates back to the spec to start a fresh run. This prevents the race condition where clearing cache mid-run causes the app to crash.\n\nSequence: (1) capture current spec file, (2) navigate to specs list, (3) clear localStorage / sessionStorage / cookies / IndexedDB, (4) wait `postClearWaitMs` (default 5000ms) for the app to settle, (5) navigate back to the spec runner (auto-starts the run), (6) verify the run started.\n\nReturns `{ cleared, specFile, postClearWaitMs, actuallyStarted, escalatedToForceReload, attempts }`.\n\n`postClearWaitMs` (default 5000) — how long to wait after clearing before navigating back. Increase for apps that eagerly re-fetch data on startup.\n`skipDatabases` (e.g. `["auth"]`) preserves named IndexedDB databases — useful when wiping `auth` would lose persisted permission grants like `permissionStatuses.geolocation: true` and break GPS-dependent tests.\n\n**`dryRun: true`** — does NOT clear or rerun; returns `wouldClear` (localStorage/session/cookie keys + IndexedDB databases with a `loadBearing` flag) so you can see what this would destroy and which DBs to `skipDatabases` first.',
       inputSchema: {
+        dryRun: z.boolean().optional(),
         timeoutMs: z.number().int().positive().max(60000).optional(),
         forceReload: z.boolean().optional(),
         skipDatabases: z.array(z.string()).optional(),
@@ -732,8 +775,13 @@ async function runMcp() {
         postClearWaitMs: z.number().int().nonnegative().max(30000).optional(),
       },
     },
-    async ({ timeoutMs = 15000, forceReload = false, skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies, postClearWaitMs = 5000 } = {}) => {
+    async ({ dryRun, timeoutMs = 15000, forceReload = false, skipDatabases, skipLocalStorage, skipSessionStorage, skipCookies, postClearWaitMs = 5000 } = {}) => {
       await ensureAttached();
+
+      if (dryRun) {
+        const preview = await cdp.evalOnRunner(probe.INSPECT_APP_STATE);
+        return textResult(JSON.stringify({ dryRun: true, note: 'Nothing was cleared or rerun.', wouldClear: preview }, null, 2));
+      }
 
       // Step 1 — capture the current spec file before navigating away.
       const specFile = await cdp.evalOnRunner(`(() => {
@@ -963,7 +1011,7 @@ async function runMcp() {
     'eval',
     {
       title: 'Evaluate JavaScript on the spec-runner page',
-      description: 'Escape hatch: run arbitrary JS on the spec-runner page where `window.Cypress`, the reporter DOM, and the AUT iframe all live. Must return a JSON-serializable value. Use for things the built-in tools do not cover (e.g. inspecting reporter MobX state, custom Cypress globals).\n\n⚠ **Live state only**: `eval` always executes against the current live page, even when a snapshot is pinned via `step_to`. Window globals (e.g. `window.myComponent`) reflect the state of the *latest* test that ran, not the pinned command\'s point in time. A `_pinnedSnapshot` warning is prepended to the result when a pin is active.',
+      description: 'Escape hatch: run arbitrary JS on the spec-runner page where `window.Cypress`, the reporter DOM, and the AUT iframe all live. Must return a JSON-serializable value. Use for things the built-in tools do not cover (e.g. inspecting reporter MobX state, custom Cypress globals).\n\n⚠ **LIVE state only — does NOT honor `step_to`.** `eval` always runs against the current live page. The JS heap (window globals, Vue/Pinia reactive stores, component instances) reflects the *latest* test that ran, NOT the pinned command\'s moment. A `_pinnedSnapshot` warning is prepended when a pin is active.\n  • For DOM **at a pinned step**, use `get_dom` / `find_in_aut` / `screenshot { kind: "aut" }` — those DO honor the pin.\n  • Cypress time-travel snapshots only the **DOM**, never the JS heap, so reading a *past* command\'s reactive/component state is impossible by any means — pin the command and read the rendered DOM instead.',
       inputSchema: { expression: z.string() },
     },
     async ({ expression }) => {
