@@ -14,15 +14,14 @@ function findCypressBin(cwd) {
   }
 }
 
-async function runOpen(extraArgs) {
+// Shared launch path: resolve the cypress bin, spawn it with the given
+// sub-command args, scrape the Chrome CDP port from the debug logs, and keep the
+// session file pointed at the latest browser. Used by both `open` and `run`.
+async function launch(subArgs) {
   const cwd = process.cwd();
   const bin = findCypressBin(cwd);
   const cmd = bin || 'npx';
-  const args = bin ? ['open', ...extraArgs] : ['cypress', 'open', ...extraArgs];
-
-  if (!args.includes('--browser')) {
-    args.push('--browser', 'chrome');
-  }
+  const args = bin ? subArgs : ['cypress', ...subArgs];
 
   const env = {
     ...process.env,
@@ -102,4 +101,62 @@ async function runOpen(extraArgs) {
   });
 }
 
-module.exports = { runOpen };
+// Does `extraArgs` already contain the given flag (e.g. '--browser')?
+function hasFlag(extraArgs, flag) {
+  return extraArgs.some((a) => a === flag || a.startsWith(flag + '='));
+}
+
+// Ensure `numTestsKeptInMemory=50` is set WITHOUT emitting a second --config
+// (Cypress honours only the last --config, so a duplicate would clobber ours).
+// Call AFTER all user args are in `subArgs` so we can merge into their --config.
+function ensureKeptInMemory(subArgs) {
+  if (subArgs.some((a) => /numTestsKeptInMemory/.test(a))) return; // already set
+  // Merge into the LAST --config (the one Cypress will actually honour).
+  let last = -1;
+  for (let i = 0; i < subArgs.length; i++) if (subArgs[i] === '--config') last = i;
+  if (last >= 0 && typeof subArgs[last + 1] === 'string') {
+    subArgs[last + 1] = subArgs[last + 1] + ',numTestsKeptInMemory=50';
+  } else {
+    subArgs.push('--config', 'numTestsKeptInMemory=50');
+  }
+}
+
+// `cypress open` — the interactive runner. Default, fully supported.
+async function runOpen(extraArgs = []) {
+  const subArgs = ['open', ...extraArgs];
+  if (!hasFlag(extraArgs, '--browser')) subArgs.push('--browser', 'chrome');
+  return launch(subArgs);
+}
+
+// `cypress run` — EXPERIMENTAL, opt-in via the `run` subcommand only.
+// Default `cypress run` is headless and exits when done (and sets
+// numTestsKeptInMemory=0), which leaves nothing to inspect. To make a run
+// inspectable we force a kept-open, headed browser that retains snapshots:
+//   --headed     keep a real Chrome with the reporter DOM + AUT iframe
+//   --no-exit    keep the runner/browser alive after the spec finishes
+//   --browser chrome   (CDP attach target; same as open mode)
+//   --config numTestsKeptInMemory=50   stop Cypress GC'ing the command log /
+//                                       time-travel snapshots (default is 0 in run)
+// All of these are skipped if the user already supplied them via `extraArgs`.
+async function runRun(extraArgs = []) {
+  const subArgs = ['run'];
+  if (!hasFlag(extraArgs, '--headed')) subArgs.push('--headed');
+  if (!hasFlag(extraArgs, '--no-exit')) subArgs.push('--no-exit');
+  if (!hasFlag(extraArgs, '--browser')) subArgs.push('--browser', 'chrome');
+  subArgs.push(...extraArgs);
+  ensureKeptInMemory(subArgs); // merge into the user's --config if present
+
+  console.error('[cypress-inspect] ⚠ run mode is EXPERIMENTAL. Drawbacks:');
+  console.error('[cypress-inspect]   • Multi-spec runs leave only the LAST spec inspectable — pass `--spec <one>`.');
+  console.error('[cypress-inspect]   • `rerun_spec` cannot re-trigger a run-mode spec (no restart UI); re-launch instead.');
+  console.error('[cypress-inspect]   • Kept open via --no-exit; close the browser/Ctrl-C when done.');
+  if (hasFlag(extraArgs, '--browser') && !extraArgs.includes('chrome')) {
+    console.error('[cypress-inspect]   • ⚠ CDP attach needs Chrome — a non-Chrome --browser will not be inspectable.');
+  }
+  if (!hasFlag(extraArgs, '--spec')) {
+    console.error('[cypress-inspect] Tip: add `-- --spec <path>` to inspect a single spec.');
+  }
+  return launch(subArgs);
+}
+
+module.exports = { runOpen, runRun };

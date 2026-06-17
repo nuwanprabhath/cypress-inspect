@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Bash(node -e \"const p=require\\('./src/cypress-probe.js'\\);require\\('fs'\\).writeFileSync\\('/tmp/stepidx.txt',p.stepToExpr\\(20,{commandIndex:2}\\)\\);console.log\\('ok'\\)\")",
+      "Bash(node -e \"require\\('./src/cypress-probe.js'\\); require\\('./src/mcp-server.js'\\); require\\('./src/failure-analysis.js'\\); console.log\\('modules load OK'\\);\")",
+      "Bash(rm -f /tmp/stepto_expr.txt /tmp/stepidx.txt /tmp/summary.txt)",
+      "Bash(node -e \"require\\('./src/cypress-probe.js'\\); require\\('./src/mcp-server.js'\\); require\\('./src/failure-analysis.js'\\); console.log\\('all modules load OK'\\);\")",
+      "Bash(rm -f /tmp/stepbefore.txt)",
+      "Bash(node -e \"require\\('./src/launcher.js'\\); require\\('./bin/cypress-inspect.js'\\)\")",
+      "Bash(node -e \"require\\('./src/launcher.js'\\); require\\('./src/mcp-server.js'\\); require\\('./src/cdp-client.js'\\); require\\('./bin/cypress-inspect.js'\\); console.log\\('all modules + CLI load OK'\\);\")",
+      "Bash(npm test *)"
+    ]
+  }
+}

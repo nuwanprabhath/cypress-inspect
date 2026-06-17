@@ -178,6 +178,40 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 
    > "A Cypress test failed. Use cypress-inspect MCP to debug it and fix it."
 
+### `cypress run` mode (experimental, opt-in)
+
+`cypress-inspect open` is the default and fully-supported path. There is also an
+**opt-in** `run` subcommand for inspecting a `cypress run` execution:
+
+```bash
+cypress-inspect run -- --spec test/cypress/integration/run/my-spec.cy.js
+```
+
+It is **not** enabled by default — you must explicitly invoke `run`. Under the
+hood it forces the flags that make a `cypress run` browser inspectable and adds
+the same CDP attach you get in `open` mode:
+
+```
+cypress run --headed --no-exit --browser chrome --config numTestsKeptInMemory=50
+```
+
+| Flag | Why it's forced |
+|---|---|
+| `--headed` | Keep a real Chrome with the reporter DOM + AUT iframe (not headless). |
+| `--no-exit` | Keep the runner/browser **alive after the spec finishes** so you can inspect it. Default `cypress run` tears the browser down and exits — leaving nothing to attach to. |
+| `--browser chrome` | The CDP attach target (same as open mode). |
+| `--config numTestsKeptInMemory=50` | Default `cypress run` sets this to **0**, which garbage-collects the command log **and time-travel snapshots** immediately. 50 keeps them so `step_to` / `get_test_commands` / before-after work. |
+
+Each forced flag is skipped if you supply your own (e.g. `-- --browser chrome --config video=false` — your `--config` is merged, not clobbered).
+
+**Drawbacks of run mode** (also printed at launch):
+
+- **Multi-spec runs leave only the *last* spec inspectable.** `cypress run` executes every matched spec sequentially and only the final browser state survives — always pass `--spec <one spec>`.
+- **`rerun_spec` cannot re-trigger a run-mode spec.** Run mode has no reporter "Rerun" button; it would fall back to `location.reload()`, which doesn't cleanly restart a run. Re-launch `cypress-inspect run` instead.
+- **Chrome only.** A non-Chrome `--browser` (e.g. `electron`) has no compatible CDP attach and won't be inspectable — the launcher warns if you override it.
+- **Kept open via `--no-exit`.** The browser stays up until you close it / Ctrl-C the launcher.
+- **Pure headless CI `cypress run` is intentionally unsupported.** Without `--headed --no-exit` there's no persistent browser to attach to; for that, use Cypress's own failure screenshots/videos.
+
 ## Tools (v0.9)
 
 ### Orientation
@@ -256,7 +290,8 @@ After saving, open Copilot Chat, switch to **Agent mode** (`@` → select the ag
 ## Limitations / caveats
 
 - **Cypress version**: written and verified against Cypress 15. Reporter class names (`.test.runnable.runnable-failed`, `.command-wrapper`, `.runnable-err-message`, etc.) are private to Cypress and may shift across versions — if a tool returns empty/`total: 0`, run the `eval` tool to discover the new class names and either tell the user or open a PR to `src/cypress-probe.js`.
-- **`cypress open` with Chrome only**. Electron mode's CDP port isn't announced the same way. Pass `--browser chrome` (the wrapper adds it automatically).
+- **Chrome only** (both `open` and `run` modes). Electron mode's CDP port isn't announced the same way. Pass `--browser chrome` (the wrapper adds it automatically).
+- **`cypress run` support is experimental and opt-in** via the `run` subcommand — see [`cypress run` mode](#cypress-run-mode-experimental-opt-in) for the forced flags and drawbacks (multi-spec only keeps the last spec; `rerun_spec` can't re-trigger a run; headless CI runs are unsupported).
 - **Port-scrape fragility**: detection relies on Cypress's `cypress:server:browsers*` debug strings. If those change, you'll see no `[cypress-inspect] Detected CDP port:` line.
 - **Console buffer is in-memory, capped at 5,000 entries**. Logs from before the MCP server attached are not captured. Best practice: start the MCP server, then run the failing spec.
 - **Network buffer is in-memory, capped at 2,000 entries**. Same "since attach" caveat — `get_network_logs` will warn when the buffer is empty so the agent doesn't blame its filter.
