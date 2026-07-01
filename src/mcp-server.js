@@ -141,7 +141,18 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.9.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.10.0' });
+
+  // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
+  // before calling it. `readOnlyHint: true` marks a tool as safe to run without
+  // side effects — clients may auto-approve these. The three ACTION tools that
+  // re-run the spec or wipe app state carry `destructiveHint: true` and an
+  // approval warning in their description so agents do not run them
+  // autonomously. `eval` is the escape hatch: it can mutate, so it is neither
+  // read-only nor flagged destructive — clients should prompt for it.
+  const READ = { readOnlyHint: true };
+  const ACTION = { readOnlyHint: false, destructiveHint: true };
+  const APPROVAL = '⚠ REQUIRES HUMAN APPROVAL — do not run autonomously; confirm with the user before calling. ';
 
   // ───────────────────────────── orientation ─────────────────────────────
 
@@ -149,7 +160,8 @@ async function runMcp() {
     'status',
     {
       title: 'Status / connection check',
-      description: 'Return Cypress session info and the list of attached CDP targets. Always call this first if a tool returns "no Cypress" — it tells you whether the spec runner is actually loaded.',
+      description: 'Cypress session info + attached CDP targets. Call this first when a tool returns "no Cypress" to check whether the spec runner is actually loaded.',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -181,7 +193,8 @@ async function runMcp() {
     'get_overview',
     {
       title: 'Get debug overview (start here)',
-      description: 'One-call orientation for an agent debugging a Cypress failure. Returns: spec file, pass/fail/pending counts, the first failed test (with title, suite path, error message, stack, code frame), the currently in-flight test, and `slowCommands` (non-null when an active command has consumed ≥50% of its timeout budget — a proactive warning before failure). This is the recommended first tool to call after status.',
+      description: 'One-call orientation for debugging a failure. Returns spec file, pass/fail/pending counts, the first failed test (title, suite path, error, stack, code frame), the in-flight test, and `slowCommands` (non-null when an active command has used ≥50% of its timeout budget — an early warning). Recommended first call after `status`.',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -195,7 +208,8 @@ async function runMcp() {
     'get_failures',
     {
       title: 'List all failed tests with details',
-      description: 'Return every failed test with suite, title, error message, stack, and code frame.\n\nAuto-annotations on every call:\n  • `rootCause: true` on the first failure; `looksLikeCascade: true` + `cascadeOf: <index>` on subsequent failures matching downstream patterns.\n  • Cascade annotations now include `cascadeEvidence` (what pattern matched: `"test-stopped"`, `"auth-context-mismatch"`, or `"timeout"`) and `cascadeConfidence: "high" | "low"`. Timeout-only matches also carry `possiblyIndependent: true` — a shared timeout pattern can mean the same underlying bug rather than state pollution from the root failure.\n  • Compare-style errors → `parsedDiff: { summary, diffs: [{ path, pathSegments, expected, actual }] }`.\n  • Top-level `flakeSignals: [{ id, explain, count, sample }]` populated by scanning the recent console buffer for known flake warnings ("random item from dropdown", "no search query provided for dropdown"). The matching IDs are also attached to the root-cause failure as `flakeSignals: ["..."]`.\n\nSet `dedupe: true` to split the response into `failures` (root + independent) and `cascadingFailures` (one-line summaries). Dedupe mode also surfaces `rootCauses: [<index>]` at the top level.',
+      description: 'Every failed test with suite, title, error, stack, and code frame. Auto-annotations: `rootCause: true` on the first failure; `looksLikeCascade: true` + `cascadeOf: <index>` on downstream ones, each with `cascadeEvidence` ("test-stopped" | "auth-context-mismatch" | "timeout") and `cascadeConfidence: "high" | "low"`. Timeout-only matches also carry `possiblyIndependent: true` (a shared timeout can be the same bug rather than pollution from the root). Compare-style errors add `parsedDiff: { summary, diffs: [{ path, pathSegments, expected, actual }] }`. Top-level `flakeSignals: [{ id, explain, count, sample }]` merges the console buffer and reporter warnings; matching ids also attach to the root failure. `dedupe: true` splits the response into `failures` (root + independent) and `cascadingFailures`, and adds top-level `rootCauses: [<index>]`.',
+      annotations: READ,
       inputSchema: {
         dedupe: z.boolean().optional(),
       },
@@ -224,7 +238,8 @@ async function runMcp() {
     'parse_compare_error',
     {
       title: 'Parse a Cypress Compare-style error into a structured diff',
-      description: 'Standalone parser for the "InProgress Summary Widget comparison failed" / "Compare - FAILURES" error format. Pass a raw error message; returns `{ summary: { failed, total }, diffs: [{ path, expected, actual }] }`, or null if the message is not a Compare error.',
+      description: 'Standalone parser for the "InProgress Summary Widget comparison failed" / "Compare - FAILURES" error format. Pass a raw message; returns `{ summary: { failed, total }, diffs: [{ path, expected, actual }] }`, or null if it is not a Compare error.',
+      annotations: READ,
       inputSchema: { message: z.string() },
     },
     async ({ message }) => {
@@ -236,7 +251,8 @@ async function runMcp() {
     'find_test',
     {
       title: 'Find a test by partial title (case-insensitive)',
-      description: 'Substring search across test titles. Returns matches with index, state, and full title. Faster than calling list_tests and scanning when you already know what test you want.',
+      description: 'Case-insensitive substring search across test titles. Returns matches with index, state, and full title. Faster than scanning `list_tests` when you know the title.',
+      annotations: READ,
       inputSchema: { query: z.string() },
     },
     async ({ query }) => {
@@ -250,7 +266,8 @@ async function runMcp() {
     'list_tests',
     {
       title: 'List all tests with state',
-      description: 'Lightweight list of every test in the spec: index, state (passed/failed/pending/running), title, suite ancestry. Use the returned `index` with `get_test_commands` and `step_to`.',
+      description: 'Every test in the spec: index, state (passed/failed/pending/running), title, suite ancestry. Use the returned `index` with `get_test_commands` and `step_to`.',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -266,7 +283,8 @@ async function runMcp() {
     'get_test_commands',
     {
       title: 'Get commands logged for a specific test',
-      description: '⚠ **For most cases prefer `get_test_commands_summary` first** — for complex tests this tool can return 50+ KB which overflows the agent\'s per-tool-result budget. Use `get_test_commands_summary` to triage, then `get_test_commands_page` for a specific window.\n\nReturns the rendered command list for the test at `index` (use `list_tests` to find it). Each entry has `number` (reporter-displayed number, NOT unique across rows — Cypress renders one logical command as 2-3 wrapper rows for parent+children), `index` (raw DOM position, unique), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength` so you can tell when content was cut. Set `full: true` to return untruncated args + text (heavier payload — use when the error message is buried in a log row\'s arg). The result also includes `numberToIndex` mapping for quickly resolving a displayed reporter number to the first DOM index, useful with `step_to { commandNumber }`.\n\n`bodyOnly: true` hides auto-logged network/resource rows (`(fetch)`/`(xhr)`/`(image)` etc.; a failed one is always kept) — a fast way to cut a noisy finished-spec panel down to the real cy.* commands.\n\nThe panel is auto-opened and the tool waits for its (virtualized) command rows to render first, so a collapsed test no longer returns empty. An empty `commands: []` that persists means the spec has finished and Cypress garbage-collected the log — trigger `rerun_spec` for a live panel.',
+      description: '⚠ Prefer `get_test_commands_summary` first — this can return 50+ KB and overflow the per-tool-result budget on complex tests. Returns the rendered command list for the test at `index`. Each entry: `number` (reporter-displayed, repeats across the 2-3 wrapper rows Cypress emits per command), `index` (unique DOM position), `name`, `arg`, `state`, plus `argTruncated`/`textTruncated` and `argLength`/`textLength`. `full: true` returns untruncated args + text (heavier). `bodyOnly: true` hides auto-logged network/resource rows ((fetch)/(xhr)/(image); a failed one is always kept). Also returns `numberToIndex` for resolving a reporter number to a DOM index. The panel is auto-opened and its virtualized rows are awaited first. A persistent empty `commands: []` means the spec finished and Cypress GC\'d the log — run `rerun_spec` for a live panel.',
+      annotations: READ,
       inputSchema: {
         index: z.number().int().nonnegative(),
         full: z.boolean().optional(),
@@ -284,7 +302,8 @@ async function runMcp() {
     'get_live_commands',
     {
       title: 'Get live cy.queue (currently-running test only)',
-      description: 'Return Cypress.cy.queue for the in-flight test. Only meaningful while a test is mid-run; for finished tests use `get_test_commands`.\n\nEach command includes:\n  • `active: true` on the currently-executing command (identified by `activeIndex` at the top level)\n  • `elapsedMs` + `timeoutBudgetUsedPct` on the active command so you can see how close it is to timing out\n  • `timeout` when the command carries an explicit timeout\n  • `suspiciouslyLargeTimeout: true` when timeout > 30 s (a red flag in normal test runs)\n\nSet `summarize: true` for a collapsed view — returns only `active`, `nextAssertion`, and `suspiciouslyLargeTimeoutCommands` instead of all raw rows. Use this when you just want to know what is stuck without parsing 100+ commands.',
+      description: '`Cypress.cy.queue` for the in-flight test (only meaningful mid-run; use `get_test_commands` for finished tests). Each command may include `active: true` (the executing one, also `activeIndex` at top level), `elapsedMs` + `timeoutBudgetUsedPct`, `timeout` when explicit, and `suspiciouslyLargeTimeout: true` (> 30 s). `summarize: true` returns only `active`, `nextAssertion`, and `suspiciouslyLargeTimeoutCommands` — use it to see what is stuck without parsing every row.',
+      annotations: READ,
       inputSchema: {
         summarize: z.boolean().optional(),
       },
@@ -300,7 +319,8 @@ async function runMcp() {
     'get_test_commands_summary',
     {
       title: 'Lightweight command summary (triage view)',
-      description: 'Returns one row per command — `index` (DOM position, use with `step_to { commandIndex }`), `number` (gutter number; null for chained child commands like `-click`/`-assert`), `name`, `arg` (≤80 chars), `state`, `type`. Cypress renders one logical command as 2-3 wrapper rows; this view collapses them. Designed for triage on complex tests where `get_test_commands` busts the token budget. Also returns `firstFailedNumber` + `firstFailedIndex` for fast jumps via `step_to`.\n\nPass EITHER `index` (a specific test) OR `forFirstFailure: true` (skip the `find_test`/`list_tests` step — uses the first failed test in the spec).\n\n`bodyOnly` (default **true**) hides auto-logged network/resource rows — `(fetch)`/`(xhr)`/`(image)` heartbeats etc. that can be 10x the real commands on a finished spec — while always keeping a failed one. When any are hidden the result carries `hiddenNoiseRows` + a `_note`. Set `bodyOnly: false` to see them, or use `get_network_logs`.\n\nThe panel is auto-opened and the tool waits for its (virtualized) command rows to render before reading, so a collapsed test no longer returns empty. If `commandCount: 0` persists, the spec has finished and Cypress has genuinely garbage-collected the log — run `rerun_spec` to get a live panel.',
+      description: 'Triage view: one row per command — `index` (DOM position, use with `step_to { commandIndex }`), `number` (gutter number; null for chained child rows like `-click`/`-assert`), `name`, `arg` (≤80 chars), `state`, `type`. Collapses the 2-3 wrapper rows Cypress emits per command. Also returns `firstFailedNumber` + `firstFailedIndex` for fast `step_to`. Pass EITHER `index` OR `forFirstFailure: true` (uses the first failed test, skipping `find_test`/`list_tests`). `bodyOnly` (default true) hides auto-logged network/resource rows ((fetch)/(xhr)/(image) heartbeats) while keeping a failed one; hidden rows are flagged via `hiddenNoiseRows` + `_note`. The panel is auto-opened and its virtualized rows are awaited. A persistent `commandCount: 0` means the spec finished and Cypress GC\'d the log — run `rerun_spec`.',
+      annotations: READ,
       inputSchema: {
         index: z.number().int().nonnegative().optional(),
         forFirstFailure: z.boolean().optional(),
@@ -331,7 +351,8 @@ async function runMcp() {
     'get_test_commands_page',
     {
       title: 'Paged command log (for huge tests)',
-      description: 'Same shape as `get_test_commands` but returns one page of wrappers (default 50). Pass `{ index, page, pageSize?, full? }`. Response includes `start/end/total/hasMore` so the caller can iterate. Use when `get_test_commands` truncation breaks your debugging flow.\n\nFinished-spec caveat: same as `get_test_commands` — Cypress GCs test panels after spec completion. If `total: 0`, trigger `rerun_spec` first.',
+      description: 'Paged variant of `get_test_commands` — one page of wrappers (default 50). Pass `{ index, page, pageSize?, full? }`; response includes `start/end/total/hasMore`. Use when `get_test_commands` would truncate. If `total: 0`, the finished-spec log was GC\'d — `rerun_spec` first.',
+      annotations: READ,
       inputSchema: {
         index: z.number().int().nonnegative(),
         page: z.number().int().nonnegative().optional(),
@@ -350,7 +371,8 @@ async function runMcp() {
     'get_failure_context',
     {
       title: 'Commands before / after the failing command',
-      description: 'Returns the N commands BEFORE and M AFTER the failing command in a given failed test (default 5 / 5). The most common follow-up to `get_failures` — skips manual slicing.\n\n**Resolving WHICH failure**:\n  • `failureIndex` — position in the `get_failures` array (0 = first failure). This is the natural way: `get_failures` returns `failures[0]`, then `get_failure_context({ failureIndex: 0 })`. If that doesn\'t match, it falls back to treating it as a test reporter index (the `.index` field on each failure).\n  • `testIndex` + optional `commandIndex` — explicit. Use when you already know exactly which test/command you want.\n\n`mode` controls what `before`/`after` count:\n  • `"logical"` (default) — UNIQUE displayed command numbers. 5/5 ≈ 5 logical cy.* calls on each side. Matches what a human sees in the reporter.\n  • `"wrappers"` — raw DOM rows. Cypress emits 2-3 wrappers per command (parent + retries), so 5/5 can return up to ~33 rows. Use only if you need exact wrapper-row diagnostics.',
+      description: 'The N commands BEFORE and M AFTER the failing command in a failed test (default 5/5). Resolve the failure by either `failureIndex` (position in the `get_failures` array; 0 = first; falls back to treating it as a reporter test `.index`) or `testIndex` (+ optional `commandIndex`). `mode: "logical"` (default) counts unique displayed command numbers — what a human sees in the reporter; `mode: "wrappers"` counts raw DOM rows (2-3 per command, so 5/5 can balloon to ~33).',
+      annotations: READ,
       inputSchema: {
         failureIndex: z.number().int().nonnegative().optional(),
         testIndex: z.number().int().nonnegative().optional(),
@@ -402,7 +424,8 @@ async function runMcp() {
     'expand_test',
     {
       title: 'Expand a test panel',
-      description: 'Open the collapsible panel for the test at `index` so its commands and error block are visible in the reporter, scroll it into view, and wait for the (virtualized) command rows to render. Returns `{ wasAlreadyOpen, isOpen, commandRowCount }`. Correctly leaves an already-open panel open (never toggles it shut). `step_to` and the `get_test_commands*` tools already do this implicitly; use this when you just want to surface a panel without time-travelling.',
+      description: 'Open the collapsible panel for the test at `index`, scroll it into view, and wait for its virtualized command rows to render. Returns `{ wasAlreadyOpen, isOpen, commandRowCount }`; never toggles an open panel shut. `step_to` and the `get_test_commands*` tools do this implicitly — use this to surface a panel without time-travelling.',
+      annotations: READ,
       inputSchema: { index: z.number().int().nonnegative() },
     },
     async ({ index }) => {
@@ -416,7 +439,8 @@ async function runMcp() {
     'get_pinned_command',
     {
       title: 'Get the currently-pinned command',
-      description: 'After `step_to`, returns which command is currently pinned (driving the AUT snapshot): `{ number, name, arg, text }`. Returns null if nothing is pinned. Matches the reporter\'s `command-is-pinned` row.',
+      description: 'After `step_to`, returns the currently-pinned command driving the AUT snapshot: `{ number, name, arg, text }`, or null if nothing is pinned.',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -430,7 +454,8 @@ async function runMcp() {
     'step_to',
     {
       title: 'Time-travel: pin to a command in a specific test',
-      description: 'Restore the AUT to the state at one command (same as clicking a command in the Cypress sidebar) — this is the core time-travel tool. Auto-opens the test panel, waits for its virtualized command rows to render, clicks the real pin target, then confirms the pin landed (`pinned: true` in the result). Three ways to specify the target:\n  • `failureIndex` — position in the `get_failures` array. Auto-resolves to the test\'s failing command. Shortest path from `get_failures` to a pinned snapshot.\n  • `testIndex` + `commandNumber` — the displayed reporter number (e.g. 38). Matches what humans see.\n  • `testIndex` + `commandIndex` — raw DOM position 0..N. Use to disambiguate duplicate reporter numbers (Cypress renders parent + child rows separately). Child commands like `-click`/`-assert` carry NO number — find their `index` via `get_test_commands_summary` and pass it here.\nIf both `commandNumber` and `commandIndex` are given, `commandNumber` wins.\n\n`snapshot`: for a command that captured both states (e.g. a click that navigated), pass `"before"` or `"after"` to choose which snapshot the AUT shows. The result\'s `snapshot` field reports `{ ok, selected, wasAlreadyActive, active }`, or `{ ok: false, reason }` when the command has only one snapshot. Use `"before"` to inspect the app state the command acted on (the common debugging case).\n\nAfter this, `get_dom` / `screenshot { kind: "aut" }` / `find_in_aut` / `get_pinned_command` all reflect the pinned step. If the panel has no rows (`ok: false`), the spec finished and Cypress GC\'d the log — `rerun_spec` for a live panel.',
+      description: 'Time-travel: pin the AUT to one command\'s state (like clicking a command in the Cypress sidebar). Auto-opens the panel, waits for rows, clicks the pin target, then confirms (`pinned: true`). Target via: `failureIndex` (position in `get_failures`; auto-resolves the failing command — shortest path); `testIndex` + `commandNumber` (the displayed reporter number, e.g. 38); or `testIndex` + `commandIndex` (raw DOM position, to disambiguate duplicate numbers or reach child rows like `-click`/`-assert` that carry no number — find their `index` via `get_test_commands_summary`). If both are given, `commandNumber` wins. `snapshot: "before"|"after"` picks which snapshot a two-state command shows (use `"before"` to see the state the command acted on); the result reports `snapshot: { ok, selected, wasAlreadyActive, active }` or `{ ok: false, reason }`. Afterwards `get_dom` / `screenshot { kind: "aut" }` / `find_in_aut` / `get_pinned_command` reflect the pin. `ok: false` (no rows) means the finished-spec log was GC\'d — `rerun_spec`.',
+      annotations: READ,
       inputSchema: {
         failureIndex: z.number().int().nonnegative().optional(),
         testIndex: z.number().int().nonnegative().optional(),
@@ -470,7 +495,8 @@ async function runMcp() {
     'get_console_logs',
     {
       title: 'Get buffered console logs',
-      description: 'Console events captured from the runner page (and any other attached pages) since the MCP server attached. Filter by `level` (log/info/warn/error/exception), substring `grep` (case-insensitive regex), `since` (epoch ms), and `limit`.\n\nWorked examples:\n  • `{ level: "error" }` — only errors\n  • `{ grep: "WARNING|deprecated" }` — match a regex across all levels\n  • `{ level: "warn", grep: "random item" }` — combine: warnings mentioning random selection (a common test-flake source)\n  • `{ grep: "selectFromDropdown" }` — find logs from a specific command\n\nTip: dropdown / picker flakiness in Cypress often shows up as `console.error("WARNING: selecting random item from dropdown ...")`. If a test fails with a value that changes each run, grep for "random item".',
+      description: 'Console events captured from attached pages since the MCP server attached. Filters: `level` (log/info/warn/error/exception), `grep` (case-insensitive regex), `since` (epoch ms), `limit` — combine freely, e.g. `{ level: "warn", grep: "random item" }`. Tip: dropdown/picker flake often surfaces as `WARNING: selecting random item from dropdown` — grep "random item" when a value changes each run. Returns a capture-status header; when empty, full diagnostics distinguish "nothing matched" from "capture broken".',
+      annotations: READ,
       inputSchema: {
         level: z.string().optional(),
         grep: z.string().optional(),
@@ -507,7 +533,8 @@ async function runMcp() {
     'screenshot',
     {
       title: 'Take screenshot',
-      description: 'PNG screenshot. kind=full (default) captures the whole runner viewport including the reporter sidebar. kind=aut clips to the app-under-test iframe only.\n\n⚠ **Scroll position caveat**: the screenshot reflects whatever the AUT iframe was last scrolled to — typically the top, or wherever the failed command left it. The image may show only a header / dialog and miss the relevant element entirely. To assert *what is actually rendered*, cross-check with `find_in_aut { selector }` — it queries the DOM directly and is unaffected by scroll. For a positive ID of the visual state at a specific step, call `step_to` first.',
+      description: 'PNG screenshot. `kind=full` (default) captures the whole runner viewport incl. the reporter sidebar; `kind=aut` clips to the app-under-test iframe. ⚠ The image reflects the AUT\'s last scroll position, so it may miss the relevant element — cross-check with `find_in_aut { selector }` (queries the DOM, unaffected by scroll), and call `step_to` first to fix the visual state at a specific step.',
+      annotations: READ,
       inputSchema: {
         kind: z.enum(['full', 'aut']).optional(),
       },
@@ -528,7 +555,8 @@ async function runMcp() {
     'list_saved_screenshots',
     {
       title: 'List saved Cypress screenshots',
-      description: 'List PNG files under cypress/screenshots/ in the project where `cypress-inspect open` was launched (sorted newest first).',
+      description: 'List PNG files under cypress/screenshots/ in the launched project, newest first.',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -546,7 +574,8 @@ async function runMcp() {
     'read_saved_screenshot',
     {
       title: 'Read saved screenshot',
-      description: 'Read a saved Cypress screenshot PNG and return it as an image. Path can be absolute or relative to the project root.',
+      description: 'Read a saved Cypress screenshot PNG and return it as an image. Path may be absolute or relative to the project root.',
+      annotations: READ,
       inputSchema: { path: z.string() },
     },
     async ({ path: p }) => {
@@ -563,7 +592,8 @@ async function runMcp() {
     'get_dom',
     {
       title: 'Get rendered HTML of the app under test',
-      description: 'Read the AUT iframe DOM (same-origin iframe inside the runner). Returns the current snapshot — call `step_to` first to time-travel. Optional CSS `selector` restricts to one element. `maxBytes` defaults to 100 KB.',
+      description: 'Read the AUT iframe DOM (same-origin iframe in the runner) at the current snapshot — call `step_to` first to time-travel. Optional CSS `selector` restricts to one element; `maxBytes` defaults to 100 KB.',
+      annotations: READ,
       inputSchema: {
         selector: z.string().optional(),
         maxBytes: z.number().int().positive().max(1_000_000).optional(),
@@ -582,7 +612,8 @@ async function runMcp() {
     'find_in_aut',
     {
       title: 'Query AUT DOM (compact, structured)',
-      description: 'Run a CSS selector against the app-under-test iframe. Default mode returns per-element JSON `{ tag, attrs, text, textTruncated, textLength, value, visible, disabled }`. Set `textOnly: true` to get just the FULL untruncated text per match (no attrs/visibility overhead) — best for extracting summary widget content, table rows, or anything where you only care about what the user reads. Limit defaults to 25.',
+      description: 'Run a CSS selector against the AUT iframe. Default: per-element JSON `{ tag, attrs, text, textTruncated, textLength, value, visible, disabled }`. `textOnly: true` returns just the full untruncated text per match — best for summary widgets, table rows, or anything where only the visible text matters. `limit` defaults to 25.',
+      annotations: READ,
       inputSchema: {
         selector: z.string(),
         limit: z.number().int().positive().max(200).optional(),
@@ -600,7 +631,8 @@ async function runMcp() {
     'get_field',
     {
       title: 'Read a form field value (Quasar-aware)',
-      description: 'Convenience reader for a single form field — removes the `.text()` vs `.val()` vs sibling-`<span>` guesswork, especially for Quasar `q-select` where the displayed value lives outside the `<input>`. Pass `dataCy` (resolves `[data-cy=...]`) OR a raw `selector`. Returns `{ found, displayText, inputValue, inputType, disabled, role, ariaExpanded, visible }`.\n\nReads the AUT DOM so it **honors `step_to`** (the field value at a pinned snapshot). Note: the Vue/Pinia `modelValue` is JS-heap state and is live-only — not retrievable at a past snapshot (see `eval` caveats); `displayText`/`inputValue` are the snapshot-accurate equivalents.',
+      description: 'Read a single form field, resolving the `.text()` vs `.val()` vs sibling-`<span>` ambiguity (esp. Quasar `q-select`, where the display value lives outside the `<input>`). Pass `dataCy` (`[data-cy=...]`) OR a raw `selector`. Returns `{ found, displayText, inputValue, inputType, disabled, role, ariaExpanded, visible }`. Reads the AUT DOM, so it honors `step_to`. Note: Vue/Pinia `modelValue` is live-only heap state; `displayText`/`inputValue` are the snapshot-accurate equivalents.',
+      annotations: READ,
       inputSchema: {
         dataCy: z.string().optional(),
         selector: z.string().optional(),
@@ -618,7 +650,8 @@ async function runMcp() {
     'get_aut_info',
     {
       title: 'Get AUT iframe URL / location / online state',
-      description: 'Returns the AUT iframe src, current location (href / pathname / hash / search), document.title, readyState, and navigator.onLine. Use to confirm the app is where you expect after `step_to`.',
+      description: 'AUT iframe src, location (href/pathname/hash/search), document.title, readyState, and navigator.onLine, plus a `capture` block (attached targets/contexts, events seen). Use to confirm the app is where you expect after `step_to`.',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -645,7 +678,8 @@ async function runMcp() {
     'get_clock',
     {
       title: 'Get AUT clock + timezone (date/flake debugging)',
-      description: 'Returns the app-under-test\'s current time and timezone so you do not have to compute date math by hand via `eval`. Fields: `nowISO`, `nowEpochMs`, `timezoneOffsetMin` (minutes; e.g. -600 for AEST), `resolvedTimeZone` (IANA name), `autTimezoneOffsetMin`, and `cy.clock` state — `clockFrozen` (true when a test installed a fake timer) plus `clockNowEpochMs`/`clockNowISO` for the frozen time. Off-by-one / timezone bugs (e.g. a `deployment_period` that shifts a day) are a classic Cypress flake class; check this first when a date assertion is suspicious.',
+      description: 'The AUT\'s current time and timezone, so you do not compute date math via `eval`. Fields: `nowISO`, `nowEpochMs`, `timezoneOffsetMin` (e.g. -600 for AEST), `resolvedTimeZone` (IANA), `autTimezoneOffsetMin`, and `cy.clock` state — `clockFrozen` plus `clockNowEpochMs`/`clockNowISO` when a fake timer is installed. Check this first for suspicious date assertions (a classic timezone/off-by-one flake class).',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -661,7 +695,8 @@ async function runMcp() {
     'get_network_logs',
     {
       title: 'Buffered network requests',
-      description: 'CDP-captured network requests since the MCP server attached. Filters: `grep` (case-insensitive regex on URL), `since` (epoch ms), `statusMin/statusMax`, `failedOnly: true` (shorthand for failed OR status >= 400), `limit` (default 100). Each entry: `{ method, url, status, mime, durationMs, failed, failureText, ts, requestBody, responseBody }`.\n\n**Bodies**: `requestBody` (POST/PUT payload) is captured for every request; `responseBody` is captured ONLY for ERROR responses (status >= 400), both truncated to 4 KB (`requestBodyTruncated`/`responseBodyTruncated` flag when cut). So `get_network_logs({ failedOnly: true })` shows the exact 4xx/5xx that triggered a backend rejection AND its response body — the root cause behind a "400 Bad Request" toast — in one call. For a non-error response body, use `eval` with `Network`/fetch.',
+      description: 'CDP-captured network requests since the MCP server attached. Filters: `grep` (case-insensitive regex on URL), `since` (epoch ms), `statusMin`/`statusMax`, `failedOnly: true` (failed OR status >= 400), `limit` (default 100). Each row: `{ method, url, status, mime, durationMs, failed, failureText, ts, requestBody, responseBody }`. `requestBody` is captured for every request; `responseBody` only for errors (status >= 400); both truncated to 4 KB with `requestBodyTruncated`/`responseBodyTruncated` flags. So `{ failedOnly: true }` shows each 4xx/5xx and its response body — the root cause behind a "400 Bad Request" toast — in one call. For a non-error response body, use `eval`.',
+      annotations: READ,
       inputSchema: {
         grep: z.string().optional(),
         since: z.number().optional(),
@@ -707,7 +742,8 @@ async function runMcp() {
     'get_storage',
     {
       title: 'Snapshot localStorage / sessionStorage / IndexedDB / cookies',
-      description: 'Read-only snapshot of the AUT iframe storage. Returns:\n  • `localStorage` — every key/value (each value clipped to 1 KB)\n  • `sessionStorage` — same shape\n  • `indexedDB` — list of `{ name, version }` from indexedDB.databases() (object store contents NOT dumped; use `eval` for that)\n  • `cookies` — document.cookie string\n\nUse to diagnose flakes caused by stale local state from a previous run (auth tokens, cached models, partially-synced PouchDB databases).',
+      description: 'Read-only snapshot of AUT storage: `localStorage` and `sessionStorage` (values clipped to 1 KB), `indexedDB` (list of `{ name, version }`; store contents not dumped — use `get_indexeddb`), and `cookies` (document.cookie). Use to diagnose flakes from stale local state (auth tokens, cached models, partially-synced PouchDB).',
+      annotations: READ,
       inputSchema: {},
     },
     async () => {
@@ -721,7 +757,8 @@ async function runMcp() {
     'clear_app_state',
     {
       title: 'Clear localStorage / sessionStorage / cookies / IndexedDB (AUT)',
-      description: 'Best-effort wipe of the app-under-test storage: clears localStorage, sessionStorage, every cookie on the current host, and deletes every IndexedDB database listed by indexedDB.databases(). Returns counts + `databasesSkipped: []`. Pair with `rerun_spec` for a clean-slate re-run. WRITE OPERATION on the app — use deliberately.\n\n**`dryRun: true`** — inspect what WOULD be wiped without touching anything: returns `localStorageKeys`, `sessionStorageKeys`, `cookieNames`, and `databases: [{ name, version, loadBearing }]`, plus `loadBearingDatabases` (those whose names suggest synced/seed data a spec may read without re-seeding). **Run this first** before a destructive clear on an unfamiliar spec.\n\n⚠ **Some databases hold permission/seed state** that affects subsequent tests in non-obvious ways:\n  • `auth` typically caches permission grants like `permissionStatuses.geolocation: true` — wiping it can break GPS-dependent tests on the next run.\n  • Synced/cached data DBs (apiModels, dexie, postCache, …) — clearing breaks specs that read already-synced data without re-seeding.\nPass `skipDatabases: ["auth", ...]` to preserve those. Granular flags `skipLocalStorage` / `skipSessionStorage` / `skipCookies` also available.',
+      description: APPROVAL + 'WRITE OPERATION. Best-effort wipe of AUT storage: localStorage, sessionStorage, every cookie on the host, and every IndexedDB database from indexedDB.databases(). Returns counts + `databasesSkipped`. Pair with `rerun_spec` for a clean re-run. **`dryRun: true` inspects what WOULD be wiped** (`localStorageKeys`, `sessionStorageKeys`, `cookieNames`, `databases: [{ name, version, loadBearing }]`, `loadBearingDatabases`) without touching anything — run it first on an unfamiliar spec. ⚠ Some DBs hold permission/seed state: `auth` caches grants like `permissionStatuses.geolocation: true` (wiping breaks GPS-dependent tests); synced caches (apiModels, dexie, postCache, …) break specs that read already-synced data. Preserve with `skipDatabases: ["auth", ...]`, or the flags `skipLocalStorage`/`skipSessionStorage`/`skipCookies`.',
+      annotations: ACTION,
       inputSchema: {
         dryRun: z.boolean().optional(),
         skipDatabases: z.array(z.string()).optional(),
@@ -745,7 +782,8 @@ async function runMcp() {
     'rerun_spec',
     {
       title: 'Re-run the current spec from the top',
-      description: 'Triggers a full re-run of the currently-loaded spec.\n\nStrategy (with auto-escalation):\n  1. Click the reporter\'s restart button (leaves AUT in-memory state intact)\n  2. Try `Cypress.action("runner:restart")` / `Cypress.emit("restart")` (often a no-op in Cypress 15 but cheap)\n  3. **If steps 1-2 did not actually restart the spec, automatically falls back to `window.location.reload()`** — no second tool call required.\n\nALWAYS post-verifies via reporter state (a test enters `running`, totals reset, or the reporter clears for a page reload). Response includes `actuallyStarted`, `escalatedToForceReload`, and an `attempts: [...]` array so the agent can see exactly what happened.\n\nPass `forceReload: true` to skip straight to the reload (useful if you already know in-memory state doesn\'t matter). `await: true` (default) blocks up to `timeoutMs` (default 15 s); `await: false` skips both verification and auto-escalation.\n\nCypress does not expose a "rerun failed only" hook — this is a full re-run. Often most useful via `reset_and_rerun`.',
+      description: APPROVAL + 'Triggers a full re-run of the currently-loaded spec (Cypress has no "rerun failed only" hook). Strategy with auto-escalation: (1) click the reporter restart button (leaves AUT in-memory state intact); (2) try `Cypress.action("runner:restart")`/`Cypress.emit("restart")` (often a no-op in Cypress 15 but cheap); (3) if those did not restart, automatically fall back to `window.location.reload()` — no second call. Always post-verifies via reporter state (a test enters `running`, totals reset, or the reporter clears for a reload); the response includes `actuallyStarted`, `escalatedToForceReload`, and an `attempts: [...]` array. `forceReload: true` skips straight to the reload. `await: true` (default) blocks up to `timeoutMs` (default 15 s); `await: false` skips verification and auto-escalation. Often best via `reset_and_rerun`.',
+      annotations: ACTION,
       inputSchema: {
         await: z.boolean().optional(),
         timeoutMs: z.number().int().positive().max(60000).optional(),
@@ -763,7 +801,8 @@ async function runMcp() {
     'reset_and_rerun',
     {
       title: 'Clear app state + rerun spec (one-shot)',
-      description: 'Safe clear-and-rerun: navigates to the Cypress specs list first (stopping any in-progress run so the app is idle), wipes all app storage, waits for the app to settle, then navigates back to the spec to start a fresh run. This prevents the race condition where clearing cache mid-run causes the app to crash.\n\nSequence: (1) capture current spec file, (2) navigate to specs list, (3) clear localStorage / sessionStorage / cookies / IndexedDB, (4) wait `postClearWaitMs` (default 5000ms) for the app to settle, (5) navigate back to the spec runner (auto-starts the run), (6) verify the run started.\n\nReturns `{ cleared, specFile, postClearWaitMs, actuallyStarted, escalatedToForceReload, attempts }`.\n\n`postClearWaitMs` (default 5000) — how long to wait after clearing before navigating back. Increase for apps that eagerly re-fetch data on startup.\n`skipDatabases` (e.g. `["auth"]`) preserves named IndexedDB databases — useful when wiping `auth` would lose persisted permission grants like `permissionStatuses.geolocation: true` and break GPS-dependent tests.\n\n**`dryRun: true`** — does NOT clear or rerun; returns `wouldClear` (localStorage/session/cookie keys + IndexedDB databases with a `loadBearing` flag) so you can see what this would destroy and which DBs to `skipDatabases` first.',
+      description: APPROVAL + 'Safe clear-and-rerun: navigate to the specs list (stopping any in-progress run so the app is idle), wipe all app storage, wait for the app to settle, then navigate back to the spec to start fresh — avoiding the crash from clearing cache mid-run. Sequence: capture spec file → go to specs list → clear localStorage/sessionStorage/cookies/IndexedDB → wait `postClearWaitMs` (default 5000) → return to the runner (auto-starts) → verify. Returns `{ cleared, specFile, postClearWaitMs, actuallyStarted, escalatedToForceReload, attempts }`. Raise `postClearWaitMs` for apps that eagerly re-fetch on startup. `skipDatabases` (e.g. `["auth"]`) preserves named IndexedDB databases (wiping `auth` can lose grants like `permissionStatuses.geolocation: true` and break GPS-dependent tests). **`dryRun: true`** clears/reruns nothing and returns `wouldClear` (storage keys + databases with a `loadBearing` flag).',
+      annotations: ACTION,
       inputSchema: {
         dryRun: z.boolean().optional(),
         timeoutMs: z.number().int().positive().max(60000).optional(),
@@ -827,7 +866,8 @@ async function runMcp() {
     'get_indexeddb',
     {
       title: 'Read records from an IndexedDB store in the AUT',
-      description: 'Opens an IndexedDB database on the AUT iframe and either lists its object stores OR dumps records from one store. Designed for the PouchDB / offline-cache debugging case ("what is actually queued / cached?").\n\nUsage:\n  • `{ dbName }` — list stores: `[{ name, count, keyPath, autoIncrement }]`\n  • `{ dbName, store }` — dump records (default 25, max 500). Each value is JSON-stringified and clipped to `valueMaxBytes` (default 2 KB) so the payload stays manageable.\n\nFor larger or filtered reads use `eval` directly — this tool intentionally trades flexibility for ergonomics.',
+      description: 'Open an IndexedDB database on the AUT and either list its object stores or dump one store\'s records — for the PouchDB/offline-cache case. `{ dbName }` lists stores `[{ name, count, keyPath, autoIncrement }]`; `{ dbName, store }` dumps records (default 25, max 500), each JSON-stringified and clipped to `valueMaxBytes` (default 2 KB). Use `eval` for larger or filtered reads.',
+      annotations: READ,
       inputSchema: {
         dbName: z.string(),
         store: z.string().optional(),
@@ -846,7 +886,8 @@ async function runMcp() {
     'get_failure_dom',
     {
       title: 'DOM at the failure frame (convenience: step_to + get_dom)',
-      description: 'For a failed test, time-travel to the failing command and return the AUT DOM at that snapshot. Combines `step_to` + `get_dom` so you don\'t have to chain them. Pass `failureIndex` (the test index) and optional `selector` / `maxBytes`.',
+      description: 'Convenience: `step_to` the failing command of a failed test, then return the AUT DOM at that snapshot (combines `step_to` + `get_dom`). Pass `failureIndex` (the test index) and optional `selector`/`maxBytes`.',
+      annotations: READ,
       inputSchema: {
         failureIndex: z.number().int().nonnegative(),
         selector: z.string().optional(),
@@ -878,7 +919,8 @@ async function runMcp() {
     'wait_for_failure',
     {
       title: 'Block until the failure count grows (or timeout)',
-      description: 'Polls the reporter until the failed-test count exceeds `baseline` (default: current count). Returns the new failure when it appears, or `{ timedOut: true, currentCounts: {...} }` after `timeoutMs` (max 120000, default 60000). When it times out the response includes the latest pass/fail/pending/unknown counts so the caller can distinguish "spec is still running" from "spec passed cleanly". For an explicit "wait until the spec finishes" primitive, prefer `wait_for_completion`.',
+      description: 'Poll the reporter until the failed-test count exceeds `baseline` (default: current count), then return the new failure — or `{ timedOut: true, currentCounts, finishedCleanly }` after `timeoutMs` (max 120000, default 60000) so you can tell "still running" from "passed cleanly". For "wait until the spec finishes", prefer `wait_for_completion`.',
+      annotations: READ,
       inputSchema: {
         baseline: z.number().int().nonnegative().optional(),
         timeoutMs: z.number().int().positive().max(120000).optional(),
@@ -922,7 +964,8 @@ async function runMcp() {
     'wait_for_completion',
     {
       title: 'Block until every test has a final state (passed / failed / pending)',
-      description: 'Polls the reporter until `unknown === 0` and `running === 0` AND the total is > 0 (i.e. every test has been evaluated). Returns the final counts and whether the spec passed cleanly. Use this as the canonical "wait for the run to finish" primitive — cleaner than treating a `wait_for_failure` timeout as success.',
+      description: 'Poll the reporter until every test has a final state (`unknown === 0 && running === 0 && total > 0`). Returns the final counts and whether the spec passed cleanly. The canonical "wait for the run to finish" primitive — cleaner than treating a `wait_for_failure` timeout as success.',
+      annotations: READ,
       inputSchema: {
         timeoutMs: z.number().int().positive().max(600000).optional(),
         pollMs: z.number().int().positive().max(5000).optional(),
@@ -963,7 +1006,8 @@ async function runMcp() {
     'cypress_docs',
     {
       title: 'Look up official Cypress documentation',
-      description: 'Fetch the canonical Cypress docs page for a command or topic from docs.cypress.io. Uses the LLM-friendly markdown mirror under /llm/markdown when available, falling back to a docs URL otherwise. Pass a `topic` like "cy.intercept", "intercept", "session", "retries", "best-practices", "selectors". Use this BEFORE asserting that "Cypress can / cannot X" — the docs are the source of truth, not your training data. The response includes a `url` you can cite to the user.',
+      description: 'Fetch the canonical Cypress docs page for a command/topic from docs.cypress.io (LLM-friendly markdown mirror under /llm/markdown when available). Pass a `topic` like "cy.intercept", "session", "retries", "best-practices", "selectors". Use BEFORE asserting "Cypress can/cannot X" — the docs are the source of truth, not training data. The response includes a citable `url`.',
+      annotations: { readOnlyHint: true, openWorldHint: true },
       inputSchema: { topic: z.string() },
     },
     async ({ topic }) => {
@@ -983,7 +1027,8 @@ async function runMcp() {
     'analyze_spec',
     {
       title: 'Static analysis of a Cypress spec for flake smells',
-      description: 'Lint a Cypress spec file against the Cypress AI Toolkit explain-test rules. Detects:\n  • brittle-selector — cy.get/find with bare tag / single class / :nth-child / id (no data-cy)\n  • hardcoded-wait — cy.wait(<number>) literals\n  • missing-assertion — it() body with no .should / .and / expect / cy.contains / assert\n  • await-on-cypress — `await cy.*` (Cypress chains are not real Promises)\n  • null-helper-arg — selectFromDropdown(..., null) and similar (often triggers random selection → flake)\n  • focused-test / skipped-test — .only / .skip left in\n  • ui-only-setup — many clicks/types before first assertion with no cy.session / cy.request\n  • overlong-test — single it() longer than `maxTestLines` (default 80)\n\nPass `source` directly OR `path` (resolved relative to the active project from cypress-inspect open). Returns `{ smells: [...], summary: {<rule>: count}, tests: [...] }`.',
+      description: 'Static lint of a Cypress spec against the Cypress AI Toolkit explain-test rules: `brittle-selector` (cy.get/find with bare tag/single class/:nth-child/id, no data-cy), `hardcoded-wait` (cy.wait(<number>)), `missing-assertion` (it() with no .should/.and/expect/cy.contains/assert), `await-on-cypress` (`await cy.*`), `null-helper-arg` (e.g. selectFromDropdown(..., null) → random-selection flake), `focused-test`/`skipped-test` (.only/.skip), `ui-only-setup` (many clicks/types before the first assertion, no cy.session/cy.request), `overlong-test` (it() longer than `maxTestLines`, default 80). Pass `source` directly OR `path` (relative to the active project). Returns `{ smells, summary, tests }`.',
+      annotations: READ,
       inputSchema: {
         path: z.string().optional(),
         source: z.string().optional(),
@@ -1011,7 +1056,8 @@ async function runMcp() {
     'eval',
     {
       title: 'Evaluate JavaScript on the spec-runner page',
-      description: 'Escape hatch: run arbitrary JS on the spec-runner page where `window.Cypress`, the reporter DOM, and the AUT iframe all live. Must return a JSON-serializable value. Use for things the built-in tools do not cover (e.g. inspecting reporter MobX state, custom Cypress globals).\n\n⚠ **LIVE state only — does NOT honor `step_to`.** `eval` always runs against the current live page. The JS heap (window globals, Vue/Pinia reactive stores, component instances) reflects the *latest* test that ran, NOT the pinned command\'s moment. A `_pinnedSnapshot` warning is prepended when a pin is active.\n  • For DOM **at a pinned step**, use `get_dom` / `find_in_aut` / `screenshot { kind: "aut" }` — those DO honor the pin.\n  • Cypress time-travel snapshots only the **DOM**, never the JS heap, so reading a *past* command\'s reactive/component state is impossible by any means — pin the command and read the rendered DOM instead.',
+      description: 'Escape hatch: run arbitrary JS on the spec-runner page (where `window.Cypress`, the reporter DOM, and the AUT iframe live) for things the built-in tools do not cover (reporter MobX state, custom Cypress globals). Must return a JSON-serializable value. ⚠ LIVE state only — does NOT honor `step_to`; the JS heap (window globals, Vue/Pinia stores, component instances) reflects the latest test that ran, not the pinned command. A `_pinnedSnapshot` warning is prepended when a pin is active. For DOM at a pinned step use `get_dom`/`find_in_aut`/`screenshot { kind: "aut" }`; Cypress snapshots only the DOM, never the JS heap, so a past command\'s reactive/component state is unreadable — pin and read the rendered DOM instead.',
+      annotations: { readOnlyHint: false },
       inputSchema: { expression: z.string() },
     },
     async ({ expression }) => {

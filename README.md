@@ -212,7 +212,9 @@ Each forced flag is skipped if you supply your own (e.g. `-- --browser chrome --
 - **Kept open via `--no-exit`.** The browser stays up until you close it / Ctrl-C the launcher.
 - **Pure headless CI `cypress run` is intentionally unsupported.** Without `--headed --no-exit` there's no persistent browser to attach to; for that, use Cypress's own failure screenshots/videos.
 
-## Tools (v0.9)
+## Tools (v0.10)
+
+Every tool carries an MCP [annotation](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations) so clients can reason about it before calling. Read-only tools are marked `readOnlyHint: true` (clients may auto-approve them). The three tools that re-run a spec or wipe app state — `clear_app_state`, `rerun_spec`, `reset_and_rerun` — are marked `destructiveHint: true` and their descriptions begin with **"⚠ REQUIRES HUMAN APPROVAL — do not run autonomously"** so an agent won't trigger runs on its own. `eval` is neither (it can mutate), so clients should prompt for it. **The actual gate is your MCP client's permission system** — e.g. in Claude Code, leave these tools off the allowlist so each call prompts; the annotations/warnings just make that the obvious default.
 
 ### Orientation
 | Tool | Use |
@@ -257,9 +259,9 @@ Each forced flag is skipped if you supply your own (e.g. `-- --browser chrome --
 | --- | --- |
 | `get_storage` | Snapshot of localStorage, sessionStorage, cookies, and IndexedDB database **names** from the AUT iframe. Each value clipped to 1 KB. Use to diagnose stale-state flakes (cached auth, partially-synced PouchDB databases). For object-store contents see `get_indexeddb`. |
 | `get_indexeddb` `{ dbName, store?, limit?, valueMaxBytes? }` | Open an IndexedDB database and either list its object stores (omit `store`) or dump records from one store (default 25, max 500). Values are JSON-stringified and clipped to `valueMaxBytes` (default 2 KB). Designed for PouchDB / offline-queue debugging without writing eval payloads. |
-| `clear_app_state` `{ skipDatabases?, skipLocalStorage?, skipSessionStorage?, skipCookies? }` | **Write operation.** Clears localStorage, sessionStorage, cookies, and IndexedDB databases in the AUT. ⚠ Some DBs (e.g. `auth`) hold persisted permission state like `permissionStatuses.geolocation: true` — wiping them can silently break GPS-dependent tests. Pass `skipDatabases: ["auth"]` to preserve those. |
-| `rerun_spec` `{ await?, timeoutMs?, forceReload? }` | Re-run the current spec from the top. Tries clicking the reporter's "Rerun all tests" button first; if that doesn't actually restart, **auto-escalates to `location.reload()`** within the same call — no second round-trip. Pass `forceReload: true` to skip straight to the reload. Returns `{ actuallyStarted, escalatedToForceReload, attempts: [...] }` so the agent sees exactly what happened. |
-| `reset_and_rerun` `{ timeoutMs?, forceReload?, skipDatabases? }` | `clear_app_state` then `rerun_spec` with the same auto-escalation. Returns both reports. `skipDatabases` preserves named IndexedDB databases (e.g. `["auth"]`). |
+| `clear_app_state` `{ skipDatabases?, skipLocalStorage?, skipSessionStorage?, skipCookies? }` | **⚠ Requires human approval — write operation.** Clears localStorage, sessionStorage, cookies, and IndexedDB databases in the AUT. ⚠ Some DBs (e.g. `auth`) hold persisted permission state like `permissionStatuses.geolocation: true` — wiping them can silently break GPS-dependent tests. Pass `skipDatabases: ["auth"]` to preserve those. |
+| `rerun_spec` `{ await?, timeoutMs?, forceReload? }` | **⚠ Requires human approval.** Re-run the current spec from the top. Tries clicking the reporter's "Rerun all tests" button first; if that doesn't actually restart, **auto-escalates to `location.reload()`** within the same call — no second round-trip. Pass `forceReload: true` to skip straight to the reload. Returns `{ actuallyStarted, escalatedToForceReload, attempts: [...] }` so the agent sees exactly what happened. |
+| `reset_and_rerun` `{ timeoutMs?, forceReload?, skipDatabases? }` | **⚠ Requires human approval.** `clear_app_state` then `rerun_spec` with the same auto-escalation. Returns both reports. `skipDatabases` preserves named IndexedDB databases (e.g. `["auth"]`). |
 | `wait_for_failure` `{ baseline?, timeoutMs?, pollMs? }` | Block until the failure count grows past `baseline`, then return the new failure. On timeout, response now includes `currentCounts` + `finishedCleanly` so callers can distinguish "still running" from "spec passed". For a positive "wait until finished" signal use `wait_for_completion`. |
 | `wait_for_completion` `{ timeoutMs?, pollMs? }` | Block until every test has a final state (`unknown === 0 && running === 0 && total > 0`). Returns `{ completed: true, passed: bool, counts, firstFailure }`. The canonical "wait for the spec to finish" primitive. Default timeout 180 s. |
 
@@ -298,7 +300,7 @@ Each forced flag is skipped if you supply your own (e.g. `-- --browser chrome --
 - **Cypress garbage-collects test panels after a spec completes.** `get_test_commands*` returns empty for finished specs; trigger `rerun_spec` (or `reset_and_rerun`) to repopulate.
 - **Re-launching Chrome** (close → re-pick spec in the Cypress App) is handled automatically: the launcher writes the new CDP port to `~/.cypress-inspect/session.json` and the MCP server re-attaches on the next tool call. If the very next tool returns "no CDP target", give the new Chrome 1-2 s and retry — the auto-rebind needs the new spec runner page to load.
 - **Mid-call WebSocket drops** (Chrome briefly hangs, the launchpad opens a new tab) trigger a single auto-retry inside `evalOnRunner` — the affected tool call should still succeed without bubbling the raw `ECONNREFUSED` / "WebSocket is not open" error to the agent.
-- **No write tools.** The plugin is read-only by design — it scrapes/clicks the runner UI, never modifies your project files or Cypress config.
+- **Mostly read-only.** Every tool is annotated: read-only tools carry `readOnlyHint: true`. The only tools with side effects are `rerun_spec` / `reset_and_rerun` (re-trigger a spec run) and `clear_app_state` (wipe AUT storage) — all marked `destructiveHint: true` with a "requires human approval" warning — plus `eval` (arbitrary JS). None of these modify your project files or Cypress config; they scrape/click the runner UI and the app's own storage. Gate them via your MCP client's permission settings.
 
 ## Inspirations
 
