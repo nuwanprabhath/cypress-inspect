@@ -89,7 +89,63 @@ async function runMcp() {
     return { triggered, actuallyStarted, evidence, currentCounts, verifyWindow };
   }
 
-  async function triggerAndVerifyRerun({ awaitFlag, timeoutMs, forceReload }) {
+  // Poll the app-health probe until the dev server is serving a complete bundle.
+  // Editing app source starts a rebuild; rerunning inside that window boots the
+  // AUT against empty JS and the spec dies ~2 minutes later at an unrelated
+  // assertion. Waiting a few seconds here removes that whole failure class.
+  async function waitForAppHealthy(timeoutMs = 20000, pollMs = 750) {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    let waitedMs = 0;
+    const startedAt = Date.now();
+    for (;;) {
+      last = await cdp.evalOnRunner(probe.APP_HEALTH).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+      waitedMs = Date.now() - startedAt;
+      // A blank AUT is expected BETWEEN runs (Cypress parks it on about:blank and
+      // the previous app is torn down), so it must not block a rerun. Only
+      // unservable assets mean "the dev server is not ready".
+      // A blank/unmounted AUT is expected BETWEEN runs, so it must not block a
+      // rerun — only unservable entry bundles mean "the dev server is not ready".
+      // `indeterminate` (AUT on about:blank, no scripts to check) fails OPEN: a
+      // check we cannot perform must never stop the user from running tests.
+      const assetProblems = (last?.problems || []).filter((p) => /Entry bundle/.test(p));
+      if (last?.indeterminate || assetProblems.length === 0) return { healthy: true, waitedMs, health: last, ...(last?.indeterminate ? { unverified: true } : {}) };
+      if (Date.now() >= deadline) return { healthy: false, waitedMs, health: last, problems: assetProblems };
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+  }
+
+  // After a rerun starts, confirm the app actually mounted. Catches the residual
+  // case where assets served fine but the app still failed to boot.
+  async function verifyAppBooted(timeoutMs = 12000, pollMs = 750) {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    for (;;) {
+      last = await cdp.evalOnRunner(probe.APP_HEALTH).catch(() => null);
+      const m = last?.mounted;
+      if (m && m.realUrl && !m.blank && m.elementCount > 5) return { booted: true, health: last };
+      if (Date.now() >= deadline) return { booted: false, health: last };
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+  }
+
+  async function triggerAndVerifyRerun({ awaitFlag, timeoutMs, forceReload, skipHealthCheck = false }) {
+    // Pre-flight: never start a run against a half-built bundle.
+    let preflight = null;
+    if (!skipHealthCheck) {
+      preflight = await waitForAppHealthy();
+      if (!preflight.healthy) {
+        return {
+          ok: false,
+          abortedBeforeRerun: true,
+          reason: 'App is not servable — refusing to start a run that would fail for the wrong reason.',
+          waitedForRebuildMs: preflight.waitedMs,
+          problems: preflight.problems,
+          health: preflight.health,
+          hint: 'A dev-server rebuild (or a broken build) is in progress. Fix the build or wait, then retry. Pass skipHealthCheck: true to override.',
+        };
+      }
+    }
     const before = await cdp.evalOnRunner(probe.OVERVIEW).catch(() => null);
     const baselineCounts = before?.counts || null;
     const baseline = {
@@ -116,10 +172,26 @@ async function runMcp() {
 
     const totalWindow = attempts.reduce((s, a) => s + a.verifyWindow, 0);
     const usedForceReload = forceReload || attempts.length > 1;
+
+    // Post-flight: the run started, but did the app actually render? Surfaces a
+    // failed boot in seconds instead of letting the first test time out against
+    // a blank page and report a misleading selector/assertion error.
+    let boot = null;
+    if (!skipHealthCheck && final.actuallyStarted) {
+      boot = await verifyAppBooted();
+    }
+
     return {
       triggered: final.triggered,
       actuallyStarted: final.actuallyStarted,
       evidence: final.evidence,
+      ...(preflight?.waitedMs > 1500 ? { waitedForRebuildMs: preflight.waitedMs } : {}),
+      ...(boot && !boot.booted ? {
+        appBootFailed: true,
+        appBootProblems: boot.health?.problems || [],
+        appBootHint: 'The run started but the app under test rendered nothing. Every test will now fail against a blank page — the errors will NOT describe the real cause. Check the dev server for a build error, then rerun. `check_app_health` has the detail.',
+        health: boot.health,
+      } : {}),
       escalatedToForceReload: attempts.length > 1,
       attempts: attempts.map((a) => ({
         via: a.triggered?.via || null,
@@ -141,7 +213,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.10.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.11.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without
@@ -779,20 +851,36 @@ async function runMcp() {
   );
 
   server.registerTool(
+    'check_app_health',
+    {
+      title: 'Is the app under test servable and mounted?',
+      description: 'Read-only build/boot check for the app under test. Returns `{ ok, indeterminate, appOrigin, mounted, entryScripts, problems }`. Call it right after editing app source and BEFORE rerunning: during a dev-server rebuild the shell keeps serving while its JS bundles do not, so a run started in that window boots a blank app and every test then fails with an error that has nothing to do with the real cause. `mounted.blank: true` = the AUT loaded a real URL but rendered nothing (app failed to mount) — expected between runs, a red flag during one. `entryScripts[]` re-fetches each `<script src>` from the AUT iframe\'s OWN window (never the runner page: a runner-side fetch of the app origin is answered by Cypress\'s proxy with HTTP 200 and the 26-byte body "TypeError: Failed to fetch"). Each row carries `{ status, bytes, contentType, isJs }` — `isJs` is the load-bearing one, because a missing bundle ALSO returns HTTP 200 with a small `text/plain` body, so status and size both lie. `indeterminate: true` (AUT on about:blank between runs) means build state could not be verified and is not a failure. `rerun_spec` runs this automatically.',
+      annotations: READ,
+      inputSchema: {},
+    },
+    async () => {
+      await ensureAttached();
+      const result = await cdp.evalOnRunner(probe.APP_HEALTH);
+      return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  server.registerTool(
     'rerun_spec',
     {
       title: 'Re-run the current spec from the top',
-      description: APPROVAL + 'Triggers a full re-run of the currently-loaded spec (Cypress has no "rerun failed only" hook). Strategy with auto-escalation: (1) click the reporter restart button (leaves AUT in-memory state intact); (2) try `Cypress.action("runner:restart")`/`Cypress.emit("restart")` (often a no-op in Cypress 15 but cheap); (3) if those did not restart, automatically fall back to `window.location.reload()` — no second call. Always post-verifies via reporter state (a test enters `running`, totals reset, or the reporter clears for a reload); the response includes `actuallyStarted`, `escalatedToForceReload`, and an `attempts: [...]` array. `forceReload: true` skips straight to the reload. `await: true` (default) blocks up to `timeoutMs` (default 15 s); `await: false` skips verification and auto-escalation. Often best via `reset_and_rerun`.',
+      description: APPROVAL + 'Triggers a full re-run of the currently-loaded spec (Cypress has no "rerun failed only" hook). Strategy with auto-escalation: (1) click the reporter restart button (leaves AUT in-memory state intact); (2) try `Cypress.action("runner:restart")`/`Cypress.emit("restart")` (often a no-op in Cypress 15 but cheap); (3) if those did not restart, automatically fall back to `window.location.reload()` — no second call. Always post-verifies via reporter state (a test enters `running`, totals reset, or the reporter clears for a reload); the response includes `actuallyStarted`, `escalatedToForceReload`, and an `attempts: [...]` array. `forceReload: true` skips straight to the reload. `await: true` (default) blocks up to `timeoutMs` (default 15 s); `await: false` skips verification and auto-escalation. BUILD SAFETY: before triggering, it waits (up to 20 s) for the JS assets of the app under test to serve completely, so a run is never started against a half-finished dev-server rebuild — the failure mode where the AUT boots blank and the spec dies minutes later at an unrelated assertion. If the build never becomes servable it returns `abortedBeforeRerun: true` without running. After the run starts it confirms the app actually rendered and returns `appBootFailed: true` within seconds if not. `skipHealthCheck: true` disables both. Often best via `reset_and_rerun`.',
       annotations: ACTION,
       inputSchema: {
         await: z.boolean().optional(),
         timeoutMs: z.number().int().positive().max(60000).optional(),
         forceReload: z.boolean().optional(),
+        skipHealthCheck: z.boolean().optional(),
       },
     },
-    async ({ await: awaitFlag = true, timeoutMs = 15000, forceReload = false } = {}) => {
+    async ({ await: awaitFlag = true, timeoutMs = 15000, forceReload = false, skipHealthCheck = false } = {}) => {
       await ensureAttached();
-      const result = await triggerAndVerifyRerun({ awaitFlag, timeoutMs, forceReload });
+      const result = await triggerAndVerifyRerun({ awaitFlag, timeoutMs, forceReload, skipHealthCheck });
       return textResult(JSON.stringify(result, null, 2));
     },
   );
@@ -946,7 +1034,7 @@ async function runMcp() {
         await new Promise((r) => setTimeout(r, pollMs));
       }
       const counts = lastOverview?.counts || null;
-      const finishedCleanly = counts && counts.unknown === 0 && counts.running === 0 && counts.total > 0 && counts.failed === 0;
+      const finishedCleanly = counts && counts.unknown === 0 && counts.running === 0 && (counts.queued || 0) === 0 && counts.total > 0 && counts.failed === 0;
       return textResult(JSON.stringify({
         timedOut: true,
         baseline: base,
@@ -964,7 +1052,7 @@ async function runMcp() {
     'wait_for_completion',
     {
       title: 'Block until every test has a final state (passed / failed / pending)',
-      description: 'Poll the reporter until every test has a final state (`unknown === 0 && running === 0 && total > 0`). Returns the final counts and whether the spec passed cleanly. The canonical "wait for the run to finish" primitive — cleaner than treating a `wait_for_failure` timeout as success.',
+      description: 'Poll the reporter until every test has a final state (`unknown === 0 && running === 0 && queued === 0 && total > 0`). Returns the final counts and whether the spec passed cleanly. The canonical "wait for the run to finish" primitive — cleaner than treating a `wait_for_failure` timeout as success.',
       annotations: READ,
       inputSchema: {
         timeoutMs: z.number().int().positive().max(600000).optional(),
@@ -979,7 +1067,11 @@ async function runMcp() {
         const o = await cdp.evalOnRunner(probe.OVERVIEW);
         last = o;
         const c = o?.counts;
-        if (c && c.total > 0 && (c.unknown || 0) === 0 && (c.running || 0) === 0) {
+        // `queued` must be part of the condition: Cypress 15 marks not-yet-run
+        // tests `runnable-processing`, which now normalises to `queued` instead of
+        // falling into `unknown`. Without it this returns the moment the FIRST
+        // test finishes, reporting a mid-flight run as complete.
+        if (c && c.total > 0 && (c.unknown || 0) === 0 && (c.running || 0) === 0 && (c.queued || 0) === 0) {
           return textResult(JSON.stringify({
             completed: true,
             passed: c.failed === 0,

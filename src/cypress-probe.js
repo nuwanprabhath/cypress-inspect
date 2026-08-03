@@ -1,6 +1,111 @@
 // Self-contained JS expressions evaluated in the Cypress spec-runner page.
 // All assume `window.Cypress` exists on the runner (Cypress >= 12).
 
+// ────────────────────── reporter document resolution ──────────────────────
+// Cypress >= 10's unified runner renders the reporter into a SAME-ORIGIN
+// `<iframe id="reporter-frame">`, not into the runner document. Every reporter
+// selector therefore has to run against the iframe's document — querying the
+// runner's top-level `document` matches nothing, which the tools reported as
+// "spec has no tests" (counts all zero, empty `list_tests`) instead of "wrong
+// document". Older/embedded layouts render the reporter inline, so resolve
+// whichever document actually holds it rather than hard-coding the iframe.
+const REPORTER_DOC_HELPER = `
+    // Documents that could hold the reporter: the runner itself, the reporter
+    // frame, then any other same-origin frame. The AUT / snapshot / spec frames
+    // are excluded — they hold the app under test, and sweeping them for generic
+    // selectors like 'button' would pull app UI into reporter queries.
+    const __docCandidates = (() => {
+      const docs = [document];
+      const seenDocs = new Set(docs);
+      const seenFrames = new Set();
+      const pushFrame = (f) => {
+        if (!f || seenFrames.has(f)) return;
+        seenFrames.add(f);
+        let d = null;
+        try { d = f.contentDocument; } catch (e) { return; } // cross-origin
+        if (d && !seenDocs.has(d)) { seenDocs.add(d); docs.push(d); }
+      };
+      pushFrame(document.querySelector('#reporter-frame, iframe.reporter-frame'));
+      const rest = document.querySelectorAll('iframe:not(.aut-iframe):not(.aut-snapshot-iframe):not(.spec-iframe)');
+      for (const f of rest) pushFrame(f);
+      return docs;
+    })();
+    // First document with rendered tests wins; else the first with any reporter
+    // chrome; else the reporter frame (run not started yet, so it is legitimately
+    // empty); else the runner document.
+    const __rdoc = (() => {
+      for (const d of __docCandidates) { try { if (d.querySelector('.test.runnable')) return d; } catch (e) {} }
+      for (const d of __docCandidates) { try { if (d.querySelector('.reporter, .runnable, .command-wrapper')) return d; } catch (e) {} }
+      return __docCandidates[1] || document;
+    })();
+    const __rwin = (__rdoc && __rdoc.defaultView) || window;
+    // Query across every candidate document. Needed for controls that straddle the
+    // boundary: the pinned-snapshot before/after toggle renders in the RUNNER
+    // header while the command log it belongs to lives in the reporter frame.
+    const __qsaAll = (sel) => {
+      const out = [];
+      for (const d of __docCandidates) {
+        try { out.push(...d.querySelectorAll(sel)); } catch (e) {}
+      }
+      return out;
+    };
+    // Cypress 15 renames two reporter test states: the executing test is
+    // 'runnable-active' (not 'running') and queued tests are
+    // 'runnable-processing' (not 'pending'). Matching only the old names put the
+    // live test and every queued test into 'unknown', so counts.running was
+    // permanently 0 — indistinguishable from a halted run. 'processing' maps to
+    // 'queued', NOT 'pending': in mocha terms pending means SKIPPED.
+    const __STATE_RE = /runnable-(passed|failed|pending|running|active|processing)/;
+    const __normaliseState = (cls) => {
+      const m = (cls || '').match(__STATE_RE);
+      if (!m) return 'unknown';
+      if (m[1] === 'active') return 'running';
+      if (m[1] === 'processing') return 'queued';
+      return m[1];
+    };
+`;
+
+// ───────────────────────── command-row helpers ─────────────────────────
+// Per-command-row readers plus the locator for "which command failed the test".
+// Split out of REPORTER_DOM_HELPERS so the standalone FAILURES expression can
+// share the same failure-anchoring logic instead of re-deriving it.
+const REPORTER_COMMAND_HELPERS = `
+    const __cmdNumber = (w) => { const n = w.querySelector('.command-number, [class*="command-number"]'); return n ? n.innerText.trim() : null; };
+    const __cmdMethod = (w) => { const m = w.querySelector('.command-method, [class*="command-method"]'); return m ? m.innerText.trim() : null; };
+    // Auto-logged network / resource rows that Cypress injects into the command
+    // log (heartbeats, asset loads, xhr). These dominate finished-spec panels
+    // (we saw ~70 '(fetch) HEAD 204 /_health' rows) and drown out the cy.*
+    // commands a developer actually wrote. NOT filtered: '(new url)' navigations
+    // and '(uncaught exception)' — both are debugging signal.
+    const __NOISE_RE = /^\\(\\s*(fetch|xhr fetch|xhr|request|image|img|script|stylesheet|css|font|websocket|ws|preflight|other)\\b/i;
+    const __isNoiseCommand = (name) => !!name && __NOISE_RE.test(name);
+    // Index of the command that actually ENDED the test.
+    //
+    // Cypress also stamps 'command-state-failed' on auto-logged resource rows
+    // whose request failed. An offline spec logs dozens of those — failed map
+    // tiles, blocked heartbeats — and they all appear BEFORE the assertion that
+    // ended the test. Scanning for the FIRST failed row therefore anchored the
+    // entire failure workflow (get_failure_context, step_to { failureIndex },
+    // get_failure_dom) on a Mapbox tile instead of the failing assertion.
+    //
+    // So: take the LAST failed row that is not auto-logged noise. Last, because a
+    // failing 'cy.get(...).should(...)' marks both the parent row and the child
+    // assertion — the child is the more precise anchor, and nothing real fails
+    // after the command that stops the test.
+    const __failedCommandIdx = (wrappers) => {
+      let lastFailed = -1;
+      let lastRealFailed = -1;
+      wrappers.forEach((w, i) => {
+        if (!/command-state-failed/.test(w.className || '')) return;
+        lastFailed = i;
+        if (!__isNoiseCommand(__cmdMethod(w))) lastRealFailed = i;
+      });
+      // Fall back to a failed auto-logged row only when it is the sole candidate —
+      // then the failing xhr/request genuinely IS the failure.
+      return lastRealFailed >= 0 ? lastRealFailed : lastFailed;
+    };
+`;
+
 // ─────────────────────────── reporter DOM helpers ───────────────────────────
 // Shared JS injected into command-log expressions. Encapsulates the parts of
 // the Cypress reporter DOM that have shifted across reporter versions and that
@@ -19,8 +124,9 @@
 //   • A pinned row carries the class `command-is-pinned`.
 // `evalOnRunner` runs with awaitPromise:true, so these helpers can be async.
 const REPORTER_DOM_HELPERS = `
+    ${REPORTER_DOC_HELPER}
     const __sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const __testEls = () => [...document.querySelectorAll('.test.runnable')];
+    const __testEls = () => [...__rdoc.querySelectorAll('.test.runnable')];
     const __collapsible = (el) => (el ? el.querySelector(':scope > .collapsible') : null);
     const __isOpen = (el) => {
       if (!el) return false;
@@ -42,8 +148,8 @@ const REPORTER_DOM_HELPERS = `
     const __click = (node) => { if (node) node.click(); };
     // Clear any lingering hover so the snapshot preview can't get stuck cycling.
     const __clearHover = () => {
-      document.querySelectorAll('.command-wrapper-text, .command-wrapper-container, .command-wrapper').forEach((n) => {
-        n.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, cancelable: true, view: window, relatedTarget: document.body }));
+      __rdoc.querySelectorAll('.command-wrapper-text, .command-wrapper-container, .command-wrapper').forEach((n) => {
+        n.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, cancelable: true, view: __rwin, relatedTarget: __rdoc.body }));
       });
     };
     // EXACT '.command-wrapper' only. The substring form [class*="command-wrapper"]
@@ -68,24 +174,43 @@ const REPORTER_DOM_HELPERS = `
       }
       return { clicked, open: __isOpen(el), rows: __wrappers(el).length };
     };
-    const __cmdNumber = (w) => { const n = w.querySelector('.command-number, [class*="command-number"]'); return n ? n.innerText.trim() : null; };
-    const __cmdMethod = (w) => { const m = w.querySelector('.command-method, [class*="command-method"]'); return m ? m.innerText.trim() : null; };
-    // Auto-logged network / resource rows that Cypress injects into the command
-    // log (heartbeats, asset loads, xhr). These dominate finished-spec panels
-    // (we saw ~70 '(fetch) HEAD 204 /_health' rows) and drown out the cy.*
-    // commands a developer actually wrote. NOT filtered: '(new url)' navigations
-    // and '(uncaught exception)' — both are debugging signal.
-    const __NOISE_RE = /^\\(\\s*(fetch|xhr fetch|xhr|request|image|img|script|stylesheet|css|font|websocket|ws|preflight|other)\\b/i;
-    const __isNoiseCommand = (name) => !!name && __NOISE_RE.test(name);
+    // Cypress renders a test's error message / stack / code frame / command rows
+    // ONLY while its panel is open. After a fresh run every panel is collapsed, so
+    // reading a failed test without expanding it first yields nulls across the
+    // board — which reads as "no error recorded" rather than "panel is shut".
+    // Lighter than __ensureOpen: it settles as soon as the error text is present,
+    // instead of waiting for the full virtualized command list to stabilize.
+    const __ensureErrDetails = async (el, timeoutMs) => {
+      const deadline = Date.now() + (timeoutMs || 2000);
+      const wasOpen = __isOpen(el);
+      if (!wasOpen) { __click(__header(el)); el.scrollIntoView({ block: 'center' }); }
+      let last = -1;
+      let stable = 0;
+      let hasError = false;
+      while (Date.now() < deadline) {
+        hasError = !!el.querySelector('.runnable-err-message, [class*="runnable-err-message"]');
+        const n = __wrappers(el).length;
+        // Settle once the error is up and the command rows have stopped growing —
+        // relatedCommandIndex is read from those rows, so a partial list would
+        // anchor the failure on the wrong command.
+        if (hasError && n === last) { if (++stable >= 2) break; } else stable = 0;
+        last = n;
+        await __sleep(50);
+      }
+      return { wasOpen, open: __isOpen(el), hasError, rows: __wrappers(el).length };
+    };
+    ${REPORTER_COMMAND_HELPERS}
     // The element carrying the pin onClick handler — clicking this (not the outer
     // wrapper) is what actually time-travels the AUT.
     const __pinTarget = (w) => w.querySelector('.command-wrapper-container') || w.querySelector('.command-pin-target') || w;
-    const __pinnedEl = () => document.querySelector('.command-is-pinned, .command-wrapper.command-is-pinned, [class*="command-is-pinned"], [class*="command-pinned"], .command-wrapper.is-pinned');
+    const __pinnedEl = () => __rdoc.querySelector('.command-is-pinned, .command-wrapper.command-is-pinned, [class*="command-is-pinned"], [class*="command-pinned"], .command-wrapper.is-pinned');
     // Snapshot before/after toggle. After a command is pinned, Cypress shows two
     // buttons ('before' / 'after') for commands that captured both snapshots
     // (e.g. a click that navigated). The active button carries a purple bg
     // (Tailwind 'bg-purple-*'); the inactive one is gray.
-    const __snapshotButtons = () => [...document.querySelectorAll('button')].filter((n) => {
+    // Straddles both documents: Cypress renders this toggle in the runner header
+    // in some versions and inside the reporter in others — search everywhere.
+    const __snapshotButtons = () => __qsaAll('button').filter((n) => {
       const t = (n.innerText || '').trim().toLowerCase();
       return (t === 'before' || t === 'after') && n.children.length === 0;
     });
@@ -98,7 +223,7 @@ const REPORTER_DOM_HELPERS = `
     const __currentSnapshot = () => {
       const active = __snapshotButtons().find(__snapshotActive);
       if (active) return active.innerText.trim().toLowerCase();
-      const pill = [...document.querySelectorAll('span')].find((n) => {
+      const pill = __qsaAll('span').find((n) => {
         const t = (n.innerText || '').trim().toLowerCase();
         return (t === 'before' || t === 'after') && n.children.length === 0 && /capitalize/.test((n.className || '').toString());
       });
@@ -134,15 +259,15 @@ const REPORTER_DOM_HELPERS = `
 // Returns spec, current/last test, totals, first-failure summary. One-call orientation.
 const OVERVIEW = `(() => {
   try {
+    ${REPORTER_DOC_HELPER}
     const C = window.Cypress;
     const spec = C && C.spec ? { name: C.spec.name, relative: C.spec.relative, absolute: C.spec.absolute } : null;
 
     // Reporter totals via DOM badge or attempt-state classes.
-    const allTests = [...document.querySelectorAll('.test.runnable')];
-    const counts = { total: allTests.length, passed: 0, failed: 0, pending: 0, running: 0, unknown: 0 };
+    const allTests = [...__rdoc.querySelectorAll('.test.runnable')];
+    const counts = { total: allTests.length, passed: 0, failed: 0, pending: 0, running: 0, queued: 0, unknown: 0 };
     const tests = allTests.map((el) => {
-      const stateMatch = el.className.match(/runnable-(passed|failed|pending|running)/);
-      const state = stateMatch ? stateMatch[1] : 'unknown';
+      const state = __normaliseState(el.className);
       counts[state in counts ? state : 'unknown']++;
       const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
       let title = titleEl ? titleEl.innerText.split('\\n')[0].trim() : null;
@@ -174,6 +299,16 @@ const OVERVIEW = `(() => {
         stack: stackEl ? stackEl.innerText.slice(0, 4000) : null,
         codeFrame: codeFrameEl ? codeFrameEl.innerText.slice(0, 2000) : null,
       };
+      // A collapsed panel renders no error DOM. get_overview must stay
+      // side-effect-free (wait_for_completion / wait_for_failure poll it in a
+      // loop, and clicking the reporter on every tick would fight the user), so
+      // say WHY the fields are null rather than implying no error was recorded.
+      const collapsible = el.querySelector(':scope > .collapsible');
+      const isOpen = !!(collapsible && collapsible.classList.contains('is-open')) || el.classList.contains('is-open');
+      if (!errEl && !isOpen) {
+        firstFailure.detailsCollapsed = true;
+        firstFailure._hint = 'This failed test\\'s panel is collapsed, so Cypress has not rendered its error message, stack, or code frame. Call get_failures — it expands failed panels before reading them.';
+      }
     }
 
     const liveRunner = C && C.mocha && C.mocha.getRunner && C.mocha.getRunner();
@@ -207,12 +342,30 @@ const OVERVIEW = `(() => {
 })()`;
 
 // Returns every failed test with full error + suite ancestry.
-const FAILURES = `(() => {
+// Async because a collapsed panel renders no error DOM: each failed test is
+// expanded (and its rows awaited) before being read. Panels are left open —
+// re-collapsing would only re-hide the detail every follow-up tool needs.
+const FAILURES = `(async () => {
   try {
-    const allTests = [...document.querySelectorAll('.test.runnable')];
+    ${REPORTER_DOM_HELPERS}
     const out = [];
-    allTests.forEach((el, idx) => {
-      if (!/runnable-failed/.test(el.className)) return;
+    // Re-resolve by index rather than holding element references across awaits.
+    // Expanding a panel re-renders the reporter, and while a run is still in
+    // flight React can REPLACE the sibling test nodes — a reference captured
+    // beforehand then points at a detached node, so its click silently no-ops
+    // and every field reads back null.
+    const testAt = (i) => [...__rdoc.querySelectorAll('.test.runnable')][i];
+    const failedIdxs = [...__rdoc.querySelectorAll('.test.runnable')]
+      .map((el, idx) => ({ el, idx }))
+      .filter(({ el }) => /runnable-failed/.test(el.className))
+      .map(({ idx }) => idx);
+    for (const idx of failedIdxs) {
+      const el = testAt(idx);
+      if (el) await __ensureErrDetails(el, 2500);
+    }
+    for (const idx of failedIdxs) {
+      const el = testAt(idx);
+      if (!el) continue;
       const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
       const title = titleEl ? titleEl.innerText.split('\\n')[0].trim() : null;
       const suites = [];
@@ -234,11 +387,10 @@ const FAILURES = `(() => {
       let relatedCommandIndex = null;
       let relatedCommandNumber = null;
       let relatedCommandText = null;
-      const failedWrapperIdx = wrappers.findIndex((w) => /command-state-failed/.test(w.className || ''));
+      const failedWrapperIdx = __failedCommandIdx(wrappers);
       if (failedWrapperIdx >= 0) {
         relatedCommandIndex = failedWrapperIdx;
-        const numEl = wrappers[failedWrapperIdx].querySelector('.command-number, [class*="command-number"]');
-        if (numEl) relatedCommandNumber = numEl.innerText.trim();
+        relatedCommandNumber = __cmdNumber(wrappers[failedWrapperIdx]);
         relatedCommandText = wrappers[failedWrapperIdx].innerText.trim().slice(0, 240);
       }
       out.push({
@@ -252,7 +404,7 @@ const FAILURES = `(() => {
         relatedCommandNumber,
         relatedCommandText,
       });
-    });
+    }
     return { count: out.length, failures: out };
   } catch (e) { return { error: String(e && e.stack || e && e.message || e) }; }
 })()`;
@@ -260,9 +412,9 @@ const FAILURES = `(() => {
 // Lightweight test list — state + title + suite path. Use for orientation.
 const LIST_TESTS = `(() => {
   try {
-    const all = [...document.querySelectorAll('.test.runnable')];
+    ${REPORTER_DOC_HELPER}
+    const all = [...__rdoc.querySelectorAll('.test.runnable')];
     return all.map((el, idx) => {
-      const stateMatch = el.className.match(/runnable-(passed|failed|pending|running)/);
       const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
       const suites = [];
       let p = el.parentElement;
@@ -275,7 +427,7 @@ const LIST_TESTS = `(() => {
       }
       return {
         index: idx,
-        state: stateMatch ? stateMatch[1] : 'unknown',
+        state: __normaliseState(el.className),
         title: titleEl ? titleEl.innerText.split('\\n')[0].trim() : null,
         suites,
       };
@@ -509,15 +661,15 @@ function autDomExpr(selector, maxBytes) {
 function findTestExpr(query) {
   return `(() => {
     try {
+      ${REPORTER_DOC_HELPER}
       const q = ${JSON.stringify(String(query).toLowerCase())};
-      const all = [...document.querySelectorAll('.test.runnable')];
+      const all = [...__rdoc.querySelectorAll('.test.runnable')];
       const out = [];
       all.forEach((el, i) => {
         const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
         const title = titleEl ? titleEl.innerText.split('\\n')[0].trim() : '';
         if (title.toLowerCase().includes(q)) {
-          const stateMatch = el.className.match(/runnable-(passed|failed|pending|running)/);
-          out.push({ index: i, state: stateMatch ? stateMatch[1] : 'unknown', title });
+          out.push({ index: i, state: __normaliseState(el.className), title });
         }
       });
       return out;
@@ -681,7 +833,8 @@ function expandTestExpr(testIndex) {
 // Which command is currently pinned (i.e. has command-state-pinned or
 // .command-pinned class). Useful after step_to to verify the snapshot.
 const PINNED_COMMAND = `(() => {
-  const pinned = document.querySelector('.command-is-pinned, .command-wrapper.command-is-pinned, [class*="command-is-pinned"], [class*="command-pinned"], .command-wrapper.is-pinned');
+  ${REPORTER_DOC_HELPER}
+  const pinned = __rdoc.querySelector('.command-is-pinned, .command-wrapper.command-is-pinned, [class*="command-is-pinned"], [class*="command-pinned"], .command-wrapper.is-pinned');
   if (!pinned) return null;
   const nameEl = pinned.querySelector('.command-method, [class*="command-method"]');
   const argEl = pinned.querySelector('.command-message, [class*="command-message"]');
@@ -701,7 +854,8 @@ const PINNED_COMMAND = `(() => {
 // command number) for an agent to navigate back to the source.
 const REPORTER_WARNINGS = `(() => {
   try {
-    const allTests = [...document.querySelectorAll('.test.runnable')];
+    ${REPORTER_DOC_HELPER}
+    const allTests = [...__rdoc.querySelectorAll('.test.runnable')];
     const out = [];
     allTests.forEach((testEl, testIndex) => {
       const titleEl = testEl.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
@@ -781,13 +935,17 @@ function commandsSummaryForTestExpr(testIndex, { bodyOnly = true } = {}) {
         });
       });
       const titleEl = el.querySelector(':scope > .collapsible-header-wrapper .runnable-title, :scope .runnable-title');
-      const failed = commands.find((c) => c.state === 'failed');
+      // Resolve against the raw wrappers (not the filtered command list) so this
+      // anchor is in the same DOM-index space as get_failures.relatedCommandIndex,
+      // and so bodyOnly can never change which command is reported as the failure.
+      const failedIdx = __failedCommandIdx(wrappers);
+      const failedWrapper = failedIdx >= 0 ? wrappers[failedIdx] : null;
       const out = {
         testTitle: titleEl ? titleEl.innerText.split('\\n')[0].trim() : null,
         wrapperRowCount: wrappers.length,
         commandCount: commands.length,
-        firstFailedNumber: failed ? failed.number : null,
-        firstFailedIndex: failed ? failed.index : null,
+        firstFailedNumber: failedWrapper ? (__cmdNumber(failedWrapper) || null) : null,
+        firstFailedIndex: failedWrapper ? failedIdx : null,
         commands,
       };
       if (bodyOnly && hiddenNoise > 0) out.hiddenNoiseRows = hiddenNoise;
@@ -1054,6 +1212,94 @@ const INSPECT_APP_STATE = `(async () => {
 // Back-compat: callers using the constant still get the no-args behaviour.
 const CLEAR_APP_STATE = clearAppStateExpr();
 
+// Is the app under test actually servable and mounted?
+//
+// Motivating failure: editing app source starts a dev-server rebuild (webpack /
+// vite). Rerunning during that window serves a shell whose JS bundles come back
+// EMPTY or non-200. The app never mounts, the AUT is a blank white page, and the
+// spec fails ~2 minutes later at whatever its first assertion happens to be — an
+// error that says nothing about the real cause.
+//
+// IMPORTANT: the entry bundles must be fetched from the AUT iframe's OWN window,
+// never from the runner page. A runner-side `fetch` of the app origin goes through
+// Cypress's proxy, which answers with HTTP 200 and the 26-byte body
+// "TypeError: Failed to fetch" — a naive ok/bytes check scores that as HEALTHY.
+// `aut.contentWindow.fetch` is same-origin with the app and returns the real
+// response (verified: 14.7 MB vendor.js vs a 26-byte proxied lie).
+function appHealthExpr({ maxAssets = 6 } = {}) {
+  return `(async () => {
+    try {
+      const problems = [];
+      const aut = document.querySelector('iframe.aut-iframe');
+      if (!aut) return { ok: true, indeterminate: true, reason: 'No AUT iframe on the page — nothing to check yet.', problems: [] };
+      let w = null, d = null;
+      try { w = aut.contentWindow; d = aut.contentDocument; } catch (e) {}
+      if (!w || !d) return { ok: true, indeterminate: true, reason: 'AUT iframe is not readable yet.', problems: [] };
+
+      const href = (w.location && w.location.href) || '';
+      const realUrl = !!href && href !== 'about:blank' && !/^about:/.test(href);
+
+      // Did the app actually render? Only meaningful once the AUT holds a real
+      // URL — between runs Cypress parks it on about:blank, which is not a fault.
+      const body = d.body;
+      const elementCount = body ? body.querySelectorAll('*').length : 0;
+      const textLength = body ? (body.innerText || '').trim().length : 0;
+      const blank = realUrl && elementCount < 5 && textLength === 0;
+      const mounted = { url: href || null, realUrl, readyState: d.readyState, elementCount, textLength, blank };
+      if (blank) problems.push('AUT has loaded a real URL but rendered nothing — the app failed to mount.');
+
+      // Entry bundles the shell references. During a rebuild these are what break
+      // while the shell HTML often still serves fine from memory / the SW cache.
+      const entryScripts = [];
+      if (realUrl) {
+        const srcs = [...d.querySelectorAll('script[src]')]
+          .map((n) => n.getAttribute('src'))
+          .filter(Boolean)
+          .slice(0, ${maxAssets});
+        for (const src of srcs) {
+          let u = src;
+          try { u = new URL(src, href).href; } catch (e) {}
+          const t0 = Date.now();
+          try {
+            const res = await w.fetch(u, { cache: 'no-store' });
+            const buf = await res.arrayBuffer();
+            const contentType = res.headers.get('content-type') || '';
+            // STATUS AND SIZE BOTH LIE HERE. An unavailable bundle comes back as
+            // HTTP 200, 26 bytes, content-type text/plain, body
+            // "TypeError: Failed to fetch" (Cypress proxy / service-worker
+            // fallback); an SPA history fallback returns 200 text/html. Only the
+            // content-type reliably separates "a real bundle" from "a polite lie".
+            const isJs = /javascript|ecmascript/i.test(contentType);
+            const row = { src, ok: res.ok, status: res.status, bytes: buf.byteLength, contentType, isJs, ms: Date.now() - t0 };
+            entryScripts.push(row);
+            if (!res.ok) problems.push('Entry bundle ' + src + ' returned HTTP ' + res.status + ' — the build is broken or mid-rebuild.');
+            else if (buf.byteLength === 0) problems.push('Entry bundle ' + src + ' served 0 bytes — the dev server is mid-rebuild.');
+            else if (!isJs) problems.push('Entry bundle ' + src + ' was NOT served as JavaScript (HTTP ' + res.status + ', content-type "' + contentType + '", ' + buf.byteLength + ' bytes) — the dev server is mid-rebuild or the bundle is missing, and something returned a fallback response instead.');
+          } catch (e) {
+            entryScripts.push({ src, ok: false, status: 0, bytes: 0, ms: Date.now() - t0, error: String(e && e.message || e) });
+            problems.push('Entry bundle ' + src + ' failed to load: ' + String(e && e.message || e) + ' — the dev server is mid-rebuild or down.');
+          }
+        }
+        if (srcs.length === 0) {
+          return { ok: problems.length === 0, indeterminate: true, reason: 'AUT document exposes no <script src> to verify.', appOrigin: w.location.origin, mounted, entryScripts, problems };
+        }
+      }
+
+      return {
+        ok: problems.length === 0,
+        indeterminate: !realUrl,
+        ...(realUrl ? {} : { reason: 'AUT is between runs (about:blank) — build state cannot be verified from here.' }),
+        appOrigin: realUrl ? w.location.origin : null,
+        mounted,
+        entryScripts,
+        problems,
+      };
+    } catch (e) { return { ok: false, error: String(e && e.stack || e && e.message || e), problems: [] }; }
+  })()`;
+}
+
+const APP_HEALTH = appHealthExpr();
+
 // Reload the currently-running spec — same effect as clicking the reporter's
 // "Rerun all tests" affordance. Cypress doesn't expose a "rerun failed only"
 // API, so this is the full-spec rerun.
@@ -1074,12 +1320,14 @@ const CLEAR_APP_STATE = clearAppStateExpr();
 function rerunSpecExpr({ forceReload = false } = {}) {
   return `(() => {
     try {
+      ${REPORTER_DOC_HELPER}
       if (${forceReload}) {
         window.location.reload();
         return { ok: true, via: 'location.reload (forced)' };
       }
-      // 1. Click the reporter's restart button.
-      const candidates = [...document.querySelectorAll('button, [role="button"], [class*="restart"], [class*="rerun"], [class*="run-all"]')];
+      // 1. Click the reporter's restart button ("Rerun all tests"). It lives in the
+      //    reporter frame, so search every candidate document, not just the runner.
+      const candidates = __qsaAll('button, [role="button"], [class*="restart"], [class*="rerun"], [class*="run-all"]');
       const restartBtn = candidates.find((b) => {
         const aria = (b.getAttribute('aria-label') || '').toLowerCase();
         const title = (b.getAttribute('title') || '').toLowerCase();
@@ -1182,6 +1430,11 @@ function getIndexedDbExpr(dbName, { store = null, limit = 25, valueMaxBytes = 20
 }
 
 module.exports = {
+  APP_HEALTH,
+  appHealthExpr,
+  REPORTER_COMMAND_HELPERS,
+  REPORTER_DOM_HELPERS,
+  REPORTER_DOC_HELPER,
   OVERVIEW,
   FAILURES,
   LIST_TESTS,
