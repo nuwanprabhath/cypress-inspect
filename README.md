@@ -6,6 +6,11 @@ Gives the agent the same toolkit a human uses when staring at a failing `cypress
 
 It works by attaching to Cypress's test browser via the Chrome DevTools Protocol. **No changes to your project's Cypress config are required.**
 
+For failures that **only happen in CI**, there is no local runner to attach to — so
+[cloud mode](#cloud-mode--when-a-spec-only-fails-in-ci) points the same idea at a
+Cypress Cloud Test Replay recording instead, letting the agent read the recorded
+console and screenshot the app at any point on the run's timeline.
+
 ## Architecture
 
 ```
@@ -212,6 +217,109 @@ Each forced flag is skipped if you supply your own (e.g. `-- --browser chrome --
 - **Kept open via `--no-exit`.** The browser stays up until you close it / Ctrl-C the launcher.
 - **Pure headless CI `cypress run` is intentionally unsupported.** Without `--headed --no-exit` there's no persistent browser to attach to; for that, use Cypress's own failure screenshots/videos.
 
+### Cloud mode — when a spec only fails in CI
+
+Some failures never reproduce locally. The evidence then lives in a **Cypress Cloud
+Test Replay** recording, not in a runner you can attach to — which is why the usual
+workaround is to add `console.log` markers, push, wait for the pipeline, then dig
+through the Cloud UI by hand.
+
+Cloud mode automates the digging half:
+
+```bash
+cypress-inspect cloud
+# or straight to a replay:
+cypress-inspect cloud "https://cloud.cypress.io/projects/…/test-results/…/replay?…"
+```
+
+This launches a **separate** Chrome with CDP enabled on a **persistent profile**
+(`~/.cypress-inspect/cloud-profile`), so you sign in to cloud.cypress.io once and
+stay signed in. Paste a Test Replay link into that window (or pass it as an
+argument / call `cloud_open`), then let the agent work:
+
+> "This spec only fails in CI. Here's the Test Replay link — use the cypress-inspect
+> cloud tools to find why."
+
+It is **fully isolated from `open` / `run`**: its own browser, its own session file
+(`~/.cypress-inspect/cloud-session.json`), and a fixed port **9333**. Both modes can
+be live at the same time and neither can clobber the other's CDP port. `--port` gives
+you a second, independent cloud browser; `CHROME_PATH` overrides browser discovery.
+
+**The loop it enables.** `cloud_console_logs` prefixes every line with the moment it
+fired and a ready-to-use timeline fraction, so finding a log and *seeing the app at
+that instant* is two calls:
+
+```
+cloud_console_logs { grep: "#2317-gf-debug" }
+  # console: 282 rows on the panel, 6 matched /…/i, showing 6
+  #   (panel via console-tabpanel/virtualized-list, strategy event-id, 47 scroll steps)
+  # [ 30.22s f=0.5369] toggleDropdown: "unknown field" isOpen=false, targetOpenState=true
+  # …
+
+cloud_seek { fraction: 0.5369 }        # jump to that moment
+cloud_screenshot { kind: "app" }       # see the app exactly there
+```
+
+Or seek by wall-clock offset directly — `cloud_seek { offsetMs: 7293 }` for "7293 ms
+into the run".
+
+| Tool | Use |
+| --- | --- |
+| `cloud_status` | Browser alive? Which page? Is it a drivable replay (`isReplay`)? Signed in (`looksLoggedOut`, `authHost`)? **Start here.** |
+| `cloud_open` `{ url }` | Navigate to a Test Replay link and wait for the timeline to hydrate. |
+| `cloud_console_logs` `{ grep?, limit?, maxScrollSteps? }` | The recorded console output. Selects the Console tab for you and scrolls the virtualised list end to end. `grep` is a case-insensitive regex; omit for everything. Each line carries `[<sec> f=<fraction>]`. |
+| `cloud_timeline` | Scrubber bounds + position (`durationSec`, `positionSec`, `fraction`) and the app frame's scroll metrics. |
+| `cloud_seek` `{ offsetMs? \| fraction? \| timeMs?, scrollTo? \| scrollBy?, waitMs? }` | Seek the replay, then scroll the app frame. `offsetMs` is ms from the start of the run (usually what you want); `fraction` is 0..1; `timeMs` is an *absolute* epoch scrubber value. Returns `ok`, where it landed, and the replay's own `timer`. |
+| `cloud_screenshot` `{ kind?, saveTo? }` | PNG of the whole replay (`full`) or clipped to the app frame (`app`). `saveTo` also writes it to disk. |
+| `cloud_get_commands` `{ grep?, failedOnly?, offset?, limit? }` | The numbered command log for the replayed test. Same shape as the local `get_test_commands`. |
+| `cloud_step_to` `{ index? \| number? \| grep? }` | Scroll a command into view and click it, pinning its snapshot so the app frame shows that step. Verifies the pin landed. |
+| `cloud_list_tests` | Every test in the run, with suite, title and status. |
+| `cloud_select_test` `{ index? \| grep? }` | Replay a different test from the same run — no new URL needed. |
+| `cloud_eval` `{ expression }` | Escape hatch for Cloud UI panels the tools above don't cover. |
+
+**Stepping through commands.** Seeking by time is right when you know *when*; usually
+you know *what* — "the step where it clicked submit". So the command log is drivable
+too, and pinning a command renders the app exactly as it was at that step:
+
+```
+cloud_get_commands { grep: "submit" }
+  # commands: 181 total, 3 matched, showing 3 from offset 0 (nothing pinned)
+  # [ 88]   61      click            submit [at support/commands-publish.js:120:8]
+  # …
+
+cloud_step_to { index: 88 }            # pins it; returns ok + the replay timer
+cloud_screenshot { kind: "app" }       # the app at that step
+```
+
+`cloud_list_tests` + `cloud_select_test { grep: "…" }` then move to another test in the
+same run, after which every other cloud tool addresses the newly selected test.
+
+**Five things worth knowing:**
+
+- **Pinning a command uses a scripted click; seeking needs trusted events.** They look
+  alike but fail differently — React's `onClick` fires for untrusted clicks, so pinning
+  works from page script, whereas the scrubber's problem is React re-rendering a
+  *controlled input's value*, which no scripted event can defeat. Both paths verify
+  they landed rather than assuming.
+
+- **Seeking uses trusted pointer events, not scripted ones.** The scrubber is a
+  *controlled* React input: assigning `.value` from page script is ignored, because
+  React re-renders the previous value straight back. So `cloud_seek` presses the track
+  through CDP's `Input` domain like a real user, then polls until the position settles
+  (the value updates asynchronously — read too early and you get the *previous*
+  moment). It reports `ok`, where it landed, and the replay's own on-screen `timer` as
+  independent evidence the replay actually moved.
+- **The Console tab is selected automatically.** The replay devtools drawer opens on
+  *Network*, so the console rows aren't in the DOM at all until the tab is clicked.
+  Without this, the first scrape of a session silently returns the test tree instead.
+- **`cloud_seek` scrolls as well as seeks, deliberately.** Seeking triggers an async
+  re-render that resets the app frame's `scrollTop`, so a separately-issued scroll
+  silently does nothing. Seek → wait → scroll (re-asserted, since the replay can
+  restore scroll on a rAF) is one call so the ordering can't be got wrong.
+- **Repeated log lines are preserved.** Rows are keyed on the list's own
+  `data-cy-event-id`, so a line that legitimately fired twice stays twice — which is
+  exactly the signal you want when hunting a loop that ran more often than it should.
+
 ## Tools (v0.10)
 
 Every tool carries an MCP [annotation](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations) so clients can reason about it before calling. Read-only tools are marked `readOnlyHint: true` (clients may auto-approve them). The three tools that re-run a spec or wipe app state — `clear_app_state`, `rerun_spec`, `reset_and_rerun` — are marked `destructiveHint: true` and their descriptions begin with **"⚠ REQUIRES HUMAN APPROVAL — do not run autonomously"** so an agent won't trigger runs on its own. `eval` is neither (it can mutate), so clients should prompt for it. **The actual gate is your MCP client's permission system** — e.g. in Claude Code, leave these tools off the allowlist so each call prompts; the annotations/warnings just make that the obvious default.
@@ -300,6 +408,9 @@ Every tool carries an MCP [annotation](https://modelcontextprotocol.io/docs/conc
 - **Cypress garbage-collects test panels after a spec completes.** `get_test_commands*` returns empty for finished specs; trigger `rerun_spec` (or `reset_and_rerun`) to repopulate.
 - **Re-launching Chrome** (close → re-pick spec in the Cypress App) is handled automatically: the launcher writes the new CDP port to `~/.cypress-inspect/session.json` and the MCP server re-attaches on the next tool call. If the very next tool returns "no CDP target", give the new Chrome 1-2 s and retry — the auto-rebind needs the new spec runner page to load.
 - **Mid-call WebSocket drops** (Chrome briefly hangs, the launchpad opens a new tab) trigger a single auto-retry inside `evalOnRunner` — the affected tool call should still succeed without bubbling the raw `ECONNREFUSED` / "WebSocket is not open" error to the agent.
+- **Cloud mode depends on Cypress Cloud's private DOM.** Cypress Cloud is a hosted app that redesigns without notice, so every lookup has an ordered fallback chain ending in a structural match (the timeline scrubber is found by `data-cy`, then by class prefix, then as *any* range input whose min/max look like epoch milliseconds). When a lookup does miss, the tool returns `{ error: '<code>' }` naming which one — use `cloud_eval` to find the new selector and open a PR to `src/cloud-probe.js`. Verified against Cypress Cloud as of v0.12.0.
+- **Cloud mode needs an interactive sign-in once.** A fresh profile is redirected to your identity provider (GitHub OAuth, SSO). The tools detect this and report `looksLoggedOut` with the `authHost` rather than failing obscurely — a human has to complete that sign-in in the browser window, after which the persistent profile remembers it.
+- **`cloud_console_logs` reads what the Cloud UI has, which is what was recorded.** If a log never reached Test Replay it cannot be recovered here; and a very long run means a lot of scroll steps (282 rows took 47 steps against a ~14,000px list, a few seconds).
 - **Mostly read-only.** Every tool is annotated: read-only tools carry `readOnlyHint: true`. The only tools with side effects are `rerun_spec` / `reset_and_rerun` (re-trigger a spec run) and `clear_app_state` (wipe AUT storage) — all marked `destructiveHint: true` with a "requires human approval" warning — plus `eval` (arbitrary JS). None of these modify your project files or Cypress config; they scrape/click the runner UI and the app's own storage. Gate them via your MCP client's permission settings.
 
 ## Inspirations

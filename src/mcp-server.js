@@ -6,6 +6,11 @@ const probe = require('./cypress-probe');
 const { augmentFailures, parseCompareError } = require('./failure-analysis');
 const { fetchCypressDoc, resolveDocPath } = require('./cypress-docs');
 const { analyzeSpec } = require('./spec-analysis');
+const { readCloudSession, isCdpAlive } = require('./cloud-session');
+const { CloudCdp } = require('./cloud-cdp');
+const cloudProbe = require('./cloud-probe');
+const { seekReplay } = require('./cloud-seek');
+const cloudCommands = require('./cloud-commands');
 
 async function runMcp() {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -52,6 +57,45 @@ async function runMcp() {
       await cdp.refreshTargets();
     }
   }
+
+  // ── cloud mode ──
+  // Entirely separate from the above: a different browser, a different session
+  // file, no shared state. `cypress-inspect open` and `cypress-inspect cloud`
+  // are expected to be running at the same time, which is exactly why nothing
+  // here touches `cdp` or `attachedPort`.
+  let cloudCdp = null;
+  async function ensureCloud() {
+    const session = await readCloudSession();
+    if (!session?.port) {
+      throw new Error('No cloud debug browser. Run `cypress-inspect cloud` (optionally with a replay URL) first.');
+    }
+    if (!(await isCdpAlive(session.port))) {
+      throw new Error(
+        `The cloud debug browser recorded on port ${session.port} is not responding — it was probably closed. ` +
+        'Run `cypress-inspect cloud` again.',
+      );
+    }
+    if (!cloudCdp || cloudCdp.port !== session.port) {
+      if (cloudCdp) await cloudCdp.close().catch(() => {});
+      cloudCdp = new CloudCdp(session.port);
+    }
+    return { cloud: cloudCdp, session };
+  }
+
+  // Every cloud probe can come back with a structured `{ error }` when a
+  // selector missed. Surfacing that verbatim — rather than throwing a generic
+  // message — is what makes a Cypress Cloud redesign diagnosable.
+  function cloudProbeResult(result, hints = {}) {
+    if (result && result.error) {
+      const hint = hints[result.error];
+      return textResult(JSON.stringify({ ...result, ...(hint ? { hint } : {}) }, null, 2));
+    }
+    return textResult(JSON.stringify(result, null, 2));
+  }
+
+  const NOT_REPLAY_HINT =
+    'Load a Cypress Cloud Test Replay URL first (the link ending in /replay). ' +
+    'Use `cloud_open { url }`, and check `cloud_status` for `looksLoggedOut`.';
 
   // Shared restart-and-verify path used by both `rerun_spec` and
   // `reset_and_rerun`. Snapshots reporter state, fires the restart probe,
@@ -213,7 +257,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.11.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.14.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without
@@ -1139,6 +1183,342 @@ async function runMcp() {
       }
       const result = analyzeSpec(text, { path: resolvedPath || p || null, maxTestLines });
       return textResult(JSON.stringify(result, null, 2));
+    },
+  );
+
+  // ───────────────────── Cypress Cloud (Test Replay) ─────────────────────
+  //
+  // For the "it only fails in CI" case: the failure exists only as a Cypress
+  // Cloud recording, so there is no live runner to attach to. These tools drive
+  // a separate, CDP-enabled Chrome (`cypress-inspect cloud`) pointed at a Test
+  // Replay page, and read the recording out of its DOM. They never touch the
+  // local-runner tools above, so both can be used in the same session.
+
+  server.registerTool(
+    'cloud_status',
+    {
+      title: 'Cloud debug browser status',
+      description: 'Is the `cypress-inspect cloud` browser running, what page is loaded, and is it a drivable Test Replay? Returns `isReplay` (a timeline scrubber was found), `looksLoggedOut`, and which selector strategy matched. Call this first in a cloud debugging session.',
+      annotations: READ,
+      inputSchema: {},
+    },
+    async () => {
+      const session = await readCloudSession();
+      if (!session?.port) {
+        return textResult('No cloud debug browser. Run `cypress-inspect cloud` in a terminal (optionally with a replay URL), then retry.');
+      }
+      const version = await isCdpAlive(session.port);
+      if (!version) {
+        return textResult(JSON.stringify({
+          session,
+          alive: false,
+          hint: 'Session file exists but nothing is listening on that port — the browser was closed. Run `cypress-inspect cloud` again.',
+        }, null, 2));
+      }
+      const { cloud } = await ensureCloud();
+      const target = await cloud.currentTarget();
+      const page = await cloud.evaluate(cloudProbe.PAGE_INFO());
+      return textResult(JSON.stringify({
+        session, alive: true, browser: version.Browser, target, page,
+        ...(page?.looksLoggedOut
+          ? { hint: `Not signed in — the browser is on ${page.authHost}, an auth page. Ask the user to complete the sign-in in that browser window once; the profile is persistent, so it is remembered from then on. Then retry.` }
+          : page?.isReplay ? {} : { hint: NOT_REPLAY_HINT }),
+      }, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'cloud_open',
+    {
+      title: 'Open a Cypress Cloud URL in the debug browser',
+      description: 'Navigate the cloud debug browser to a URL — normally a Test Replay link copied from Cypress Cloud (…/test-results/<id>/replay?…). Waits for load, then reports whether the page is a drivable replay. Paste the full URL including its query string.',
+      annotations: { readOnlyHint: false },
+      inputSchema: { url: z.string() },
+    },
+    async ({ url }) => {
+      const { cloud } = await ensureCloud();
+      const nav = await cloud.navigate(url);
+      // Test Replay hydrates its timeline well after `load`, so poll for the
+      // scrubber instead of reporting "not a replay" on the first read.
+      let page = null;
+      const deadline = Date.now() + 15000;
+      for (;;) {
+        page = await cloud.evaluate(cloudProbe.PAGE_INFO()).catch(() => null);
+        if (page?.isReplay || page?.looksLoggedOut || Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      return textResult(JSON.stringify({
+        navigated: url, loadTimedOut: nav.timedOut, page,
+        ...(page?.looksLoggedOut
+          ? { hint: `Redirected to a sign-in page on ${page.authHost}. Ask the user to sign in manually in the debug browser window (the profile is persistent, so this is a one-time step), then call \`cloud_open\` again with the same URL.` }
+          : page?.isReplay ? { hint: 'Replay is ready. Use `cloud_timeline` to see the run duration, then `cloud_seek` / `cloud_screenshot` / `cloud_console_logs`.' }
+            : { hint: NOT_REPLAY_HINT }),
+      }, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'cloud_console_logs',
+    {
+      title: 'Read console logs from a Cypress Cloud replay',
+      description: 'Reconstruct the app\'s console output from the replay\'s Console panel — the tool for reading `console.log` markers you added to chase a CI-only failure. Selects the Console tab for you (the drawer defaults to Network) and scrolls the virtualised list end to end, since only ~19 rows exist in the DOM at a time. `grep` is an optional case-insensitive regex (e.g. your debug marker); omit it to read everything. `limit` keeps the last N matches. Each line is prefixed with `[<seconds> f=<fraction>]` — pass that `fraction` straight to `cloud_seek` to jump to the moment the log fired, then `cloud_screenshot` to see the app there. `totalRows` vs `matchedRows` distinguishes "nothing matched" from "nothing captured".',
+      annotations: READ,
+      inputSchema: {
+        grep: z.string().optional(),
+        limit: z.number().int().positive().max(5000).optional(),
+        maxScrollSteps: z.number().int().positive().max(2000).optional(),
+      },
+    },
+    async ({ grep, limit, maxScrollSteps = 600 } = {}) => {
+      const { cloud } = await ensureCloud();
+      const result = await cloud.evaluate(cloudProbe.consoleExpr({
+        grep: grep || null,
+        limit: limit || null,
+        maxScrollSteps,
+        stepDelayMs: 90,
+        tabWaitMs: 1200,
+      }));
+      if (result?.error) {
+        return cloudProbeResult(result, {
+          'no-console-panel': 'No console panel found. If `consoleTab.tabFound` is false the replay devtools drawer is closed — open it in the browser window (or check the page really is a Test Replay via `cloud_status`).',
+          'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
+        });
+      }
+      const header =
+        `# console: ${result.totalRows} rows on the panel, ${result.matchedRows} matched` +
+        `${grep ? ` /${grep}/i` : ''}, showing ${result.returnedRows} ` +
+        `(panel via ${result.panelVia}, strategy ${result.strategy}` +
+        `${result.consoleTab?.activated ? ', Console tab auto-selected' : ''}, ${result.scrollSteps} scroll steps)`;
+      if (!result.entries.length) {
+        return textResult(
+          `${header}\n(no rows)\n\n` +
+          (result.totalRows === 0
+            ? 'The panel was found but held no rows — the replay may still be loading. Check `cloud_status`, then retry.'
+            : 'Rows were read but none matched `grep`. Re-run without `grep` to see what is actually there.'),
+        );
+      }
+      const lines = result.entries.map((e) =>
+        (e.tSec != null ? `[${String(e.tSec).padStart(6)}s f=${e.fraction}] ` : '') + e.text);
+      return textResult(header + '\n' + lines.join('\n'));
+    },
+  );
+
+  server.registerTool(
+    'cloud_timeline',
+    {
+      title: 'Read the replay timeline position',
+      description: 'Scrubber bounds and current position (`durationSec`, `positionSec`, `fraction`) plus the app frame\'s scroll metrics. Call before `cloud_seek` to convert a wall-clock moment into a fraction, and to learn `scrollHeight` for scrolling the app.',
+      annotations: READ,
+      inputSchema: {},
+    },
+    async () => {
+      const { cloud } = await ensureCloud();
+      const result = await cloud.evaluate(cloudProbe.TIMELINE());
+      return cloudProbeResult(result, { 'no-scrubber': NOT_REPLAY_HINT });
+    },
+  );
+
+  server.registerTool(
+    'cloud_seek',
+    {
+      title: 'Seek the replay timeline (and scroll the app)',
+      description: 'Move the replay to a point in time, then optionally scroll the app frame. Give the position ONE of three ways: `offsetMs` — milliseconds from the start of the run (usually what you want, and the same clock `cloud_console_logs` timestamps use); `fraction` — 0..1 across the run; `timeMs` — an absolute scrubber value from `cloud_timeline` (an epoch timestamp, NOT an offset). `scrollTo` sets the app frame scrollTop absolutely, `scrollBy` moves it relatively — use these to bring an off-screen element into view before `cloud_screenshot`. Seek and scroll are one call on purpose: seeking triggers an async re-render that resets the app\'s scroll position, so this waits (`waitMs`, default 450) after seeking and then re-asserts the scroll. The result reports `ok`, where the timeline actually landed, and the replay\'s own on-screen `timer` as independent evidence that it moved. Follow with `cloud_screenshot`.',
+      annotations: { readOnlyHint: false },
+      inputSchema: {
+        offsetMs: z.number().optional(),
+        fraction: z.number().min(0).max(1).optional(),
+        timeMs: z.number().optional(),
+        scrollTo: z.number().optional(),
+        scrollBy: z.number().optional(),
+        waitMs: z.number().int().min(0).max(30000).optional(),
+      },
+    },
+    async ({ offsetMs, fraction, timeMs, scrollTo, scrollBy, waitMs = 450 } = {}) => {
+      if (offsetMs == null && fraction == null && timeMs == null && scrollTo == null && scrollBy == null) {
+        return textResult('Nothing to do — pass at least one of `offsetMs`, `fraction`, `timeMs`, `scrollTo`, `scrollBy`.');
+      }
+      const { cloud } = await ensureCloud();
+      // `offsetMs` is resolved against the run's own start here, so a caller who
+      // thinks in "7293 ms into the run" never has to add an epoch base — and
+      // never silently gets clamped to the start by passing it as `timeMs`.
+      let resolvedTimeMs = timeMs;
+      if (offsetMs != null && timeMs == null && fraction == null) {
+        const t = await cloud.evaluate(cloudProbe.TIMELINE());
+        if (t?.error || !t?.scrubber) {
+          return cloudProbeResult(t || { error: 'no-scrubber' }, { 'no-scrubber': NOT_REPLAY_HINT });
+        }
+        resolvedTimeMs = t.scrubber.min + offsetMs;
+      }
+      const result = await seekReplay(cloud, {
+        fraction: fraction ?? null,
+        timeMs: resolvedTimeMs ?? null,
+        scrollTo: scrollTo ?? null,
+        scrollBy: scrollBy ?? null,
+        waitMs,
+      });
+      return cloudProbeResult(result, {
+        'no-scrubber': NOT_REPLAY_HINT,
+        'scrubber-not-visible': 'The timeline scrubber exists but has no width — the replay footer may be collapsed, or the browser window too small.',
+        'no-app-frame': 'The seek worked but the app-under-test iframe was not reachable, so the scroll was skipped. The replay may still be loading its frame.',
+      });
+    },
+  );
+
+  server.registerTool(
+    'cloud_screenshot',
+    {
+      title: 'Screenshot the Cypress Cloud replay',
+      description: 'PNG of the cloud debug browser. `kind=full` (default) captures the whole replay page including the Cypress Cloud chrome; `kind=app` clips to the app-under-test frame, which is what you usually want. Call `cloud_seek` first to fix the moment in time and the app scroll position. Pass `saveTo` to also write the PNG to disk (useful when sweeping many timeline positions).',
+      annotations: READ,
+      inputSchema: {
+        kind: z.enum(['full', 'app']).optional(),
+        saveTo: z.string().optional(),
+      },
+    },
+    async ({ kind = 'full', saveTo } = {}) => {
+      const { cloud } = await ensureCloud();
+      let clip = null;
+      if (kind === 'app') {
+        clip = await cloud.evaluate(cloudProbe.APP_RECT());
+        if (!clip) {
+          return textResult('App frame not found — cannot clip. Confirm a replay is loaded with `cloud_status`, or use `kind: "full"`.');
+        }
+      }
+      const data = await cloud.screenshot({ clip });
+      const content = [];
+      if (saveTo) {
+        const abs = path.isAbsolute(saveTo) ? saveTo : path.resolve(process.cwd(), saveTo);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, Buffer.from(data, 'base64'));
+        content.push({ type: 'text', text: `Saved ${abs}` });
+      }
+      content.push({ type: 'image', mimeType: 'image/png', data });
+      return { content };
+    },
+  );
+
+  server.registerTool(
+    'cloud_get_commands',
+    {
+      title: 'List the replay command log',
+      description: 'The numbered Cypress commands for the test being replayed — same data as the local `get_test_commands`, read from the Cloud reporter. Each row: `index` (pass to `cloud_step_to`), `number` (as displayed), `method`, `message`, `state` (passed/failed/pending), `isPinned`. Filters: `grep` (case-insensitive regex over method + message), `failedOnly`, `offset`/`limit` (default 100). Top-level `total` and `matched` tell you how much you did not see. Use this to find the step you care about, then `cloud_step_to` to render it.',
+      annotations: READ,
+      inputSchema: {
+        grep: z.string().optional(),
+        failedOnly: z.boolean().optional(),
+        offset: z.number().int().min(0).optional(),
+        limit: z.number().int().positive().max(500).optional(),
+      },
+    },
+    async (args = {}) => {
+      const { cloud } = await ensureCloud();
+      const result = await cloudCommands.getCommands(cloud, args);
+      if (result?.error) {
+        return cloudProbeResult(result, {
+          'no-command-log': 'No command log found. Open a Test Replay (`cloud_open`) — the command log is the left-hand panel of the replay view.',
+          'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
+        });
+      }
+      const header = `# commands: ${result.total} total, ${result.matched} matched, showing ${result.returned} from offset ${result.offset}` +
+        (result.pinnedIndex >= 0 ? ` (currently pinned: index ${result.pinnedIndex})` : ' (nothing pinned)');
+      const lines = result.commands.map((c) =>
+        `[${String(c.index).padStart(3)}] ${(c.number || '').padStart(4)} ${c.state === 'failed' ? 'FAIL' : c.state === 'pending' ? 'pend' : '    '} ` +
+        `${(c.method || '').padEnd(16)} ${(c.message || '').slice(0, 110)}${c.isPinned ? '   ← PINNED' : ''}`);
+      return textResult(`${header}\n${lines.join('\n') || '(none matched)'}`);
+    },
+  );
+
+  server.registerTool(
+    'cloud_step_to',
+    {
+      title: 'Pin a command so the replay renders that step',
+      description: 'Scroll a command into view and click it, which pins its snapshot — the app frame then shows the DOM exactly as it was at that step, and `cloud_screenshot { kind: "app" }` captures it. This is the Cloud equivalent of the local `step_to`. Identify the command by `index` (from `cloud_get_commands`, most reliable), `number` (as displayed in the log), or `grep` (first match on method + message). Verifies the pin actually landed and returns `ok` plus the replay\'s `timer`, so a missed click is reported rather than leaving you screenshotting the previous step. Pinning an already-pinned command is a no-op (clicking it again would unpin it).',
+      annotations: { readOnlyHint: false },
+      inputSchema: {
+        index: z.number().int().min(0).optional(),
+        number: z.union([z.number(), z.string()]).optional(),
+        grep: z.string().optional(),
+        waitMs: z.number().int().min(0).max(10000).optional(),
+      },
+    },
+    async ({ index, number, grep, waitMs } = {}) => {
+      if (index == null && number == null && !grep) {
+        return textResult('Specify which command: `index` (from `cloud_get_commands`), `number`, or `grep`.');
+      }
+      const { cloud } = await ensureCloud();
+      const result = await cloudCommands.stepTo(cloud, { index, number, grep, waitMs });
+      return cloudProbeResult(result, {
+        'no-command-log': 'No command log found. Open a Test Replay first with `cloud_open`.',
+        'index-out-of-range': 'That index does not exist — call `cloud_get_commands` for the valid range.',
+        'number-not-found': 'No command carries that displayed number. Call `cloud_get_commands` to see them.',
+        'grep-no-match': 'No command matched. Try a looser `grep`, or list them with `cloud_get_commands`.',
+        'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
+      });
+    },
+  );
+
+  server.registerTool(
+    'cloud_list_tests',
+    {
+      title: 'List the tests in this run',
+      description: 'Every test in the run\'s results drawer, with `index` (pass to `cloud_select_test`), `suite`, `title` and `status` (passed/failed/pending/skipped). Use this to move to another test in the same run without pasting a new replay URL.',
+      annotations: READ,
+      inputSchema: {},
+    },
+    async () => {
+      const { cloud } = await ensureCloud();
+      const result = await cloudCommands.listTests(cloud);
+      if (result?.error) {
+        return cloudProbeResult(result, {
+          'no-test-rows': 'No test rows found. This page may not be a run\'s test-results view — check `cloud_status`.',
+        });
+      }
+      const lines = result.tests.map((t) =>
+        `[${String(t.index).padStart(3)}] ${(t.status || '?').padEnd(8)} ${t.suite ? t.suite + ' › ' : ''}${t.title}`);
+      return textResult(`# tests: ${result.total}\n${lines.join('\n')}`);
+    },
+  );
+
+  server.registerTool(
+    'cloud_select_test',
+    {
+      title: 'Replay a different test from this run',
+      description: 'Click another test\'s "Test Replay" button and wait for its replay to load, so you can debug several tests from one run without pasting new URLs. Identify it by `index` (from `cloud_list_tests`) or `grep` on suite + title. Cypress Cloud tears the current replay down before building the new one — this polls for the real end state (replay open, timeline present, command log populated) rather than guessing a delay, and reports `ok` with the new run\'s duration. After it returns, `cloud_get_commands` / `cloud_console_logs` / `cloud_seek` all address the newly selected test.',
+      annotations: { readOnlyHint: false },
+      inputSchema: {
+        index: z.number().int().min(0).optional(),
+        grep: z.string().optional(),
+        timeoutMs: z.number().int().min(1000).max(120000).optional(),
+      },
+    },
+    async ({ index, grep, timeoutMs } = {}) => {
+      if (index == null && !grep) {
+        return textResult('Specify which test: `index` (from `cloud_list_tests`) or `grep`.');
+      }
+      const { cloud } = await ensureCloud();
+      const result = await cloudCommands.selectTest(cloud, { index, grep, timeoutMs });
+      return cloudProbeResult(result, {
+        'no-test-rows': 'No test rows found — check `cloud_status` that a run\'s test-results page is loaded.',
+        'index-out-of-range': 'That index does not exist — call `cloud_list_tests` for the valid range.',
+        'grep-no-match': 'No test matched. Call `cloud_list_tests` to see the titles.',
+        'no-replay-button': 'That test has no Test Replay artifact (replay may not have been recorded for it).',
+        'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
+      });
+    },
+  );
+
+  server.registerTool(
+    'cloud_eval',
+    {
+      title: 'Evaluate JavaScript on the Cypress Cloud replay page',
+      description: 'Escape hatch for parts of the Cypress Cloud UI these tools do not cover (other panels, network rows, test metadata). Runs on the replay page itself; the app-under-test lives in a same-origin iframe reachable from there. Must return a JSON-serializable value.',
+      annotations: { readOnlyHint: false },
+      inputSchema: { expression: z.string() },
+    },
+    async ({ expression }) => {
+      const { cloud } = await ensureCloud();
+      const value = await cloud.evaluate(expression);
+      return textResult(typeof value === 'string' ? value : JSON.stringify(value, null, 2));
     },
   );
 

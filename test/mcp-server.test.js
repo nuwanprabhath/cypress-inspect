@@ -55,6 +55,35 @@ test('build-health tooling is exposed and rerun_spec can opt out of it', async (
   assert.match(byName.rerun_spec.description, /BUILD SAFETY/);
 });
 
+test('the cloud tool family registers and stays isolated from local-runner tools', async () => {
+  const { tools } = await listTools();
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+  for (const name of ['cloud_status', 'cloud_open', 'cloud_console_logs', 'cloud_timeline', 'cloud_seek', 'cloud_screenshot', 'cloud_eval']) {
+    assert.ok(byName[name], `${name} must be registered`);
+  }
+  // Cloud tools drive a separate browser, so they must not be confusable with
+  // the local-runner tools of the same purpose.
+  assert.ok(byName.screenshot && byName.cloud_screenshot, 'both screenshot tools coexist');
+  assert.ok(byName.cloud_console_logs.inputSchema.properties.grep, 'grep must be optional-but-present');
+  assert.equal(byName.cloud_seek.annotations?.readOnlyHint, false, 'seeking mutates the page');
+});
+
+test('cloud mode never reads or writes the local-runner session file', () => {
+  // The whole point of cloud mode is that it runs alongside `cypress-inspect
+  // open`. A cloud module reaching into session.js would let one clobber the
+  // other's CDP port.
+  const fs = require('fs');
+  const path = require('path');
+  const dir = path.join(__dirname, '..', 'src');
+  for (const f of ['cloud-launcher.js', 'cloud-cdp.js', 'cloud-probe.js', 'cloud-session.js']) {
+    const src = fs.readFileSync(path.join(dir, f), 'utf8');
+    assert.ok(!/require\(['"]\.\/session['"]\)/.test(src), `${f} must not require ./session`);
+  }
+  const cloudSession = fs.readFileSync(path.join(dir, 'cloud-session.js'), 'utf8');
+  assert.match(cloudSession, /cloud-session\.json/);
+  assert.ok(!/['"]session\.json['"]/.test(cloudSession), 'must not point at the local-runner session file');
+});
+
 test('check_app_health description matches what the probe actually returns', () => {
   // A stale description is a silent trap: it sent agents looking for `aut.blank`
   // and `assets` on a payload that has neither, and credited the discarded
