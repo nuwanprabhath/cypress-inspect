@@ -105,6 +105,7 @@ async function listSpecs(cloud, { timeoutMs = 20000 } = {}) {
  * common case is "show me the failure". `spec` and `grep` are then applied here.
  */
 async function listTests(cloud, { status, spec, grep, limit = 200, scroll = true, timeoutMs = 20000 } = {}) {
+  let expectedCount = null;
   if (status) {
     const applied = await cloud.evaluate(probe.statusFilterExpr({ status }));
     if (applied?.error === 'no-status-link') {
@@ -115,22 +116,54 @@ async function listTests(cloud, { status, spec, grep, limit = 200, scroll = true
         hint: `No "${status}" filter on this page. Valid: failed, passed, pending, skipped. Are you on a run's test-results view (\`cloud_open_run\`)?`,
       };
     }
-    // The list re-renders behind the filter; wait for it to settle rather than
-    // scraping the pre-filter rows.
+    expectedCount = applied?.expected ?? null;
+    // Wait for the list to actually re-render behind the filter.
+    //
+    // "Some rows are present" is NOT a sufficient signal: the pre-filter rows are
+    // still on screen for a moment, so a scrape starting then mixes both renders.
+    // Measured live as `scraped 9` on a run with 7 failures. The precise
+    // condition is that every rendered row now carries the requested status.
     await waitFor(async () => {
       const r = await cloud.evaluate(probe.runTestsExpr({ scroll: false, maxScrollSteps: 0, stepDelayMs: 0 })).catch(() => null);
       if (!r || r.error) return null;
-      if (applied?.expected == null) return r;
-      return r.scraped > 0 || applied.expected === 0 ? r : null;
-    }, { timeoutMs, pollMs: 500 });
+      if (applied?.expected === 0) return r;
+      if (!r.scraped) return null;
+      const seen = Object.keys(r.statusesSeen || {});
+      return seen.length === 1 && seen[0] === status ? r : null;
+    }, { timeoutMs, pollMs: 400 });
   }
 
-  const raw = await cloud.evaluate(probe.runTestsExpr({
+  const scrapeOnce = () => cloud.evaluate(probe.runTestsExpr({
     scroll,
     maxScrollSteps: 400,
     stepDelayMs: 120,
   }));
+
+  let raw = await scrapeOnce();
   if (raw?.error) return raw;
+
+  /*
+   * Reconcile against the run's own count.
+   *
+   * The status link tells us exactly how many rows there should be, so a scrape
+   * returning MORE than that is provably wrong — seen intermittently as
+   * "scraped 9" on a run with 7 failures, when the scrape raced a re-render and
+   * picked up rows from both. The mechanism is timing-dependent and awkward to
+   * pin down; reconciling against the authoritative number is robust whatever
+   * the cause. Retry a couple of times, and if it still disagrees, SAY SO rather
+   * than returning a list we know to be wrong.
+   */
+  let countMismatch = null;
+  if (status && expectedCount != null) {
+    for (let attempt = 0; attempt < 3 && raw.scraped > expectedCount; attempt++) {
+      await new Promise((r) => setTimeout(r, 600));
+      const retry = await scrapeOnce();
+      if (!retry?.error) raw = retry;
+    }
+    if (raw.scraped !== expectedCount) {
+      countMismatch = { expected: expectedCount, scraped: raw.scraped };
+    }
+  }
 
   let tests = raw.tests;
   if (spec) {
@@ -152,6 +185,7 @@ async function listTests(cloud, { status, spec, grep, limit = 200, scroll = true
     filter: { status: status || null, spec: spec || null, grep: grep || null },
     matched,
     returned: Math.min(matched, limit),
+    ...(countMismatch ? { countMismatch } : {}),
     tests: tests.slice(0, limit).map((t, i) => ({ ...t, index: i })),
   };
 }

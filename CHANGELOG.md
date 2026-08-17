@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.18.0
+
+### Fixed
+- **`cloud_list_tests` intermittently reported more tests than the run contains.**
+  Seen live as `scraped 9` on a run with exactly 7 failures, then `scraped 7` on the
+  identical call moments later — a race between the scrape and the list re-rendering
+  behind the status filter. Two changes, because the first alone did not settle it:
+  - Rows are keyed on the **spec path**, not the `RunTestResultRow-N` group index.
+    Applying a filter renumbers every group, so a group-index key can treat one test
+    as two when the scrape straddles a re-render.
+  - The result is **reconciled against the run's own count**. The status link states
+    exactly how many rows there should be, so a scrape returning more is provably
+    wrong: it retries, and if the disagreement persists it prints a `⚠` naming both
+    numbers instead of returning a list already known to be wrong. Verified stable
+    across repeated cold runs.
+- **The status filter was trusted too early.** Readiness was "some rows are present",
+  which the stale pre-filter render satisfies immediately. It now waits until every
+  rendered row carries the requested status.
+- **The empty-network message hedged when it did not need to.** It suggested no replay
+  might be open even when the panel was present and explicitly reporting "No network
+  requests available". That state is often the finding itself — a test that goes
+  offline deliberately records none — so it now says so, and only mentions a missing
+  replay when the panel really is absent.
+
 ## 0.17.0
 
 ### Added

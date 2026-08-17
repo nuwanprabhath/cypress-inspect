@@ -647,7 +647,13 @@ function runListSrc() {
           .filter(Boolean);
         var title = frags.length ? frags[frags.length - 1] : (w.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
         if (!title) continue;
-        var key = gi + '|' + title;
+        // Key on the SPEC PATH, not the group index. Group indices are
+        // reassigned whenever the list re-renders (applying a filter renumbers
+        // every RunTestResultRow-N), so a group-index key counts one test twice
+        // if the scrape spans a re-render — observed live as "scraped 9" on a
+        // run with 7 failures. The spec path is stable across renders.
+        var suiteKey = frags.length > 1 ? frags.slice(0, -1).join(' > ') : '';
+        var key = (spec || ('g' + gi)) + '|' + suiteKey + '|' + title;
         if (!into.has(key)) {
           into.set(key, {
             specIndex: gi,
@@ -706,11 +712,17 @@ async function runTestsProbe(opts) {
     return a.specIndex - b.specIndex;
   }).map(function (t, i) { return Object.assign({ index: i }, t); });
 
+  var statusesSeen = {};
+  for (var t = 0; t < tests.length; t++) {
+    var st = tests[t].status || 'unknown';
+    statusesSeen[st] = (statusesSeen[st] || 0) + 1;
+  }
   return {
     scraped: tests.length,
     scrolled: !!(scroller && opts.scroll),
     hadScroller: !!scroller,
     counts: runCounts(),
+    statusesSeen: statusesSeen,
     tests: tests,
   };
 }

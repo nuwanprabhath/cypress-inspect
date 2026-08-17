@@ -186,3 +186,84 @@ test('isErrorStatus treats only 4xx/5xx as failures', () => {
   assert.equal(isErrorStatus(null), false);
   assert.equal(isErrorStatus('pending'), false);
 });
+
+test('a scrape spanning a re-render does not count the same test twice', async () => {
+  // Applying a filter renumbers every RunTestResultRow-N, so a key built from
+  // the group index treats the same test as new when the scrape straddles the
+  // re-render. Observed live as "scraped 9" on a run with exactly 7 failures.
+  // Keying on the stable spec path removes the whole class.
+  // The key is built page-side, so it is asserted against the probe source.
+  const src = require('../src/cloud-probe')._internals.runListSrc();
+  assert.ok(!/var key = gi \+/.test(src), 'must not key on the volatile group index');
+  assert.match(src, /spec \|\| \('g' \+ gi\)/, 'must key on the spec path, falling back to the group index');
+});
+
+test('a status filter is not trusted until every rendered row carries that status', async () => {
+  // "Some rows are present" is satisfied by the stale pre-filter render, which
+  // is exactly how the duplicate rows got in.
+  const tests = [
+    { specIndex: 0, spec: 'a.cy.js', suite: 'A', title: 'one', status: 'failed', hasReplay: true },
+    { specIndex: 0, spec: 'a.cy.js', suite: 'A', title: 'two', status: 'passed', hasReplay: true },
+  ];
+  let renders = 0;
+  const cloud = {
+    async navigate() { return {}; },
+    async evaluate(expr) {
+      if (/function statusFilterProbe/.test(expr)) return { clicked: true, status: 'failed', expected: 1 };
+      if (/function runTestsProbe/.test(expr)) {
+        renders++;
+        // First two reads still show the mixed, pre-filter list.
+        const visible = renders <= 2 ? tests : tests.filter((t) => t.status === 'failed');
+        const statusesSeen = {};
+        for (const t of visible) statusesSeen[t.status] = (statusesSeen[t.status] || 0) + 1;
+        return { scraped: visible.length, scrolled: false, hadScroller: false, counts: { failed: 1, passed: 1 }, statusesSeen, tests: visible.map((t, i) => ({ index: i, ...t })) };
+      }
+      return {};
+    },
+  };
+  const out = await listTests(cloud, { status: 'failed', timeoutMs: 5000 });
+  assert.equal(out.matched, 1, 'must wait past the stale render rather than scraping it');
+  assert.ok(renders > 2, 'should have polled until the filtered render appeared');
+});
+
+test('a scrape that disagrees with the run count is retried, then flagged', async () => {
+  // The authoritative number comes from the status link. A scrape returning MORE
+  // than that is provably wrong (seen live as "scraped 9" on a run with 7
+  // failures, racing a re-render). Retry; if it persists, say so rather than
+  // returning a list we know is wrong.
+  const failed = [
+    { specIndex: 0, spec: 'a.cy.js', suite: 'A', title: 'one', status: 'failed', hasReplay: true },
+    { specIndex: 0, spec: 'a.cy.js', suite: 'A', title: 'two', status: 'failed', hasReplay: true },
+  ];
+  const ghost = { specIndex: 9, spec: 'stale.cy.js', suite: 'S', title: 'ghost', status: 'failed', hasReplay: true };
+
+  const build = (rows) => ({
+    scraped: rows.length, scrolled: true, hadScroller: true,
+    counts: { failed: 2 }, statusesSeen: { failed: rows.length },
+    tests: rows.map((t, i) => ({ index: i, ...t })),
+  });
+
+  let reads = 0;
+  const settling = {
+    async navigate() { return {}; },
+    async evaluate(expr) {
+      if (/function statusFilterProbe/.test(expr)) return { clicked: true, status: 'failed', expected: 2 };
+      if (/function runTestsProbe/.test(expr)) { reads++; return build(reads <= 2 ? [...failed, ghost] : failed); }
+      return {};
+    },
+  };
+  const recovered = await listTests(settling, { status: 'failed', timeoutMs: 4000 });
+  assert.equal(recovered.matched, 2, 'the retry must land on the correct list');
+  assert.equal(recovered.countMismatch, undefined, 'a recovered read is not flagged');
+
+  const stuck = {
+    async navigate() { return {}; },
+    async evaluate(expr) {
+      if (/function statusFilterProbe/.test(expr)) return { clicked: true, status: 'failed', expected: 2 };
+      if (/function runTestsProbe/.test(expr)) return build([...failed, ghost]);
+      return {};
+    },
+  };
+  const flagged = await listTests(stuck, { status: 'failed', timeoutMs: 4000 });
+  assert.deepEqual(flagged.countMismatch, { expected: 2, scraped: 3 }, 'a persistent disagreement must be surfaced');
+});

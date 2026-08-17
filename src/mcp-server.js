@@ -272,7 +272,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.17.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.18.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without
@@ -1546,7 +1546,7 @@ async function runMcp() {
       const result = await cloudNetwork.listNetwork(cloud, args);
       if (result?.error) {
         return cloudProbeResult(result, {
-          'no-network-rows': 'No requests in the replay\'s Network panel. Either this test made none, or no replay is open — check `cloud_status`.',
+          'no-network-rows': 'The Network panel is present and reports no requests, so this test recorded none. That can be the finding itself — e.g. a test that deliberately goes offline, or one that failed before issuing any request. If `hasPanel` is false instead, no replay is open — check `cloud_status`.',
           'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
         });
       }
@@ -1705,7 +1705,11 @@ async function runMcp() {
       const counts = Object.entries(result.counts || {}).map(([k, v]) => `${v} ${k}`).join(', ');
       const header = `# tests: run has ${counts || 'unknown counts'}; scraped ${result.scraped}` +
         `${result.scrolled ? ' (scrolled)' : ' (no scroll)'}, matched ${result.matched}, showing ${result.returned}` +
-        `  filter: ${JSON.stringify(result.filter)}`;
+        `  filter: ${JSON.stringify(result.filter)}` +
+        // Never present a list we can prove disagrees with the run's own count.
+        (result.countMismatch
+          ? `\n⚠ The run reports ${result.countMismatch.expected} ${result.filter.status} test(s) but ${result.countMismatch.scraped} row(s) were read — the list was probably mid-render. Re-run this call to get a clean read.`
+          : '');
       const lines = result.tests.map((t) =>
         `[${String(t.index).padStart(3)}] ${(t.status || '?').padEnd(8)} ${t.spec ? t.spec.split('/').pop() + ' › ' : ''}` +
         `${t.suite ? t.suite + ' › ' : ''}${t.title}`);
