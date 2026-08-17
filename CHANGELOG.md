@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.20.0
+
+### Fixed
+- **`cloud_open_test` could open a test from the WRONG SPEC.** After listing, the row was
+  re-found in the DOM by **title alone**. Test titles repeat across specs whenever they
+  come from shared helper commands, so asking for `specify barcode to autofill trap ID`
+  in `vertebrate-trap-3.cy.js` opened the identically-titled test in
+  `vertebrate-trap-2.cy.js` — and every tool called afterwards (failure, console,
+  network, screenshot) then described the wrong spec, confidently and with no warning.
+  Caught only because a screenshot showed `vertebrate-trap-2.cy.js` in the replay header.
+
+  Rows are now matched on **spec path + suite + title**, with the spec read from the
+  enclosing per-spec group. If no row satisfies all three it is an error, not a
+  near-enough click. As a second line of defence the replay's own header is compared to
+  the requested title after opening, and a mismatch is reported as
+  `error: 'opened-wrong-test'` rather than returned as success.
+
+### Verified
+Against run 12735: the five `vertebrate-trap-3.cy.js` failures listed, the first opened
+and confirmed as trap-3 (`clickedRow.spec`, and the error's own
+`vertebrate-trap-3.cy.js:62` origin) where it previously opened trap-2; console and
+network read for both a failed and a passed test in that spec (1070 console rows in 59
+scroll steps, 410 network rows).
+
+## 0.19.0
+
+### Fixed
+- **Filtering after opening a replay read the wrong list entirely.** Opening a Test
+  Replay leaves the run's results list mounted *behind* the overlay, frozen on whatever
+  filter was active. `cloud_list_tests { status: "passed" }` called from there returned
+  the three **failed** tests — the status link was clicked while the overlay covered the
+  list. Every listing call now returns to the results view first (reporting
+  `closedReplayFirst`), which is what a human does.
+- **`spec` was applied in JavaScript after scraping, which does not work at run scale.**
+  On a 337-test run the scrape read 208 rows and matched **none** of the target spec's
+  tests — they sort after the point the scrape reached. `spec` now drives the Cloud UI's
+  own "Spec File" filter *before* scraping, turning 337 rows into single figures and
+  making the result exact. An unmatched pattern lists the specs the run actually
+  contains instead of silently returning nothing.
+- **The count reconciliation fired false alarms.** With a spec filter applied the status
+  link still reports the run-wide count (337 passed), so a correct 8-row per-spec read
+  was flagged as a mismatch. Reconciliation now runs only when the status filter is the
+  sole narrowing — a false alarm is as corrosive as a missed one.
+- **The retry only covered one direction.** It triggered on `scraped > expected`, so the
+  filter-switch failure (`expected 337, scraped 3`) warned without ever retrying. It now
+  retries on any disagreement.
+
+### Verified
+Against run 12763: the three `camera-trap-retrieval.cy.js` failures diagnosed, its 8
+passed tests listed and one opened by `spec` + `grep` with console and network read, and
+seek + screenshot used to capture the open dropdown that explains the root failure.
+
 ## 0.18.0
 
 ### Fixed

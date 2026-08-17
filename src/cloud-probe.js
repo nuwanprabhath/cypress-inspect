@@ -981,6 +981,82 @@ async function consoleProbe(opts) {
 const consoleExpr = (opts) =>
   exprWithHelpers(consoleProbe, [frameWaitSrc(), findConsolePanelSrc()], opts);
 
+/*
+ * Close the Test Replay overlay if one is open.
+ *
+ * Opening a replay leaves the run's test-results list mounted BEHIND it, still
+ * showing whatever filter was active when the replay was opened. Any filter or
+ * listing call made from that state reads the stale background list — observed
+ * as `cloud_list_tests { status: "passed" }` returning the three FAILED tests,
+ * because the status link was clicked while the overlay covered the list.
+ * Returning to the results view first is what a human does, and makes the
+ * filters behave.
+ */
+/*
+ * Narrow the results list to one spec using the UI's own "Spec File" filter.
+ *
+ * Filtering in JS after scraping does not work at run scale: a 337-test list has
+ * to be scrolled in full before the filter can be applied, which was measured
+ * reading only 208 rows and therefore matching NONE of the target spec's tests —
+ * they sort after the point the scrape reached. Letting the Cloud UI do it turns
+ * 337 rows into single figures, and is exact.
+ */
+async function specFilterProbe(opts) {
+  var btn = document.querySelector('[data-cy=test-result-spec-filter]');
+  if (!btn) return { error: 'no-spec-filter' };
+  btn.click();
+  await new Promise(function (r) { setTimeout(r, opts.openWaitMs); });
+
+  var options = Array.prototype.slice.call(document.querySelectorAll('[role=option]'))
+    .filter(function (e) { return /\.(cy|spec)\.(js|ts|jsx|tsx)/.test(e.textContent || ''); });
+  if (!options.length) return { error: 'no-spec-options' };
+
+  var re;
+  try { re = new RegExp(opts.pattern, 'i'); } catch (e) { return { error: 'bad-spec-pattern', pattern: opts.pattern }; }
+  var matches = options.filter(function (o) { return re.test((o.textContent || '').trim()); });
+  if (!matches.length) {
+    return {
+      error: 'spec-not-found',
+      pattern: opts.pattern,
+      available: options.map(function (o) { return (o.textContent || '').trim(); }).slice(0, 40),
+    };
+  }
+  matches[0].click();
+  await new Promise(function (r) { setTimeout(r, opts.applyWaitMs); });
+  // Dismiss the menu so it does not sit over the list for later interactions.
+  var esc = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true });
+  document.dispatchEvent(esc);
+  document.body.click();
+  await new Promise(function (r) { setTimeout(r, 200); });
+
+  return {
+    selected: (matches[0].textContent || '').trim(),
+    matchedOptions: matches.length,
+    otherMatches: matches.slice(1, 6).map(function (o) { return (o.textContent || '').trim(); }),
+    totalOptions: options.length,
+  };
+}
+
+const specFilterExpr = (opts) => expr(specFilterProbe, opts);
+
+
+const CLOSE_REPLAY = () => `(() => {
+  var open = document.querySelector('[data-cy=test-replay-container]');
+  if (!open) return { wasOpen: false };
+  var btn = document.querySelector('[data-cy=close-replay-button]')
+    || document.querySelector('[data-cy=drill-in-close-btn]');
+  if (!btn) return { wasOpen: true, closed: false, error: 'no-close-button' };
+  btn.click();
+  return { wasOpen: true, closed: true };
+})()`;
+
+const RESULTS_VIEW_STATE = () => `(() => ({
+  replayOpen: !!document.querySelector('[data-cy=test-replay-container]'),
+  testRows: document.querySelectorAll('[data-cy=parent-test-row-wrapper]').length,
+  hasStatusLinks: !!document.querySelector('[data-cy=link-failed]'),
+}))()`;
+
+
 // ───────────────────────────── network panel ─────────────────────────────
 /*
  * The replay's Network tab. Rows carry the same `data-cy-event-id` /
@@ -1185,6 +1261,9 @@ module.exports = {
   REPLAY_STATE,
   runTestsExpr,
   statusFilterExpr,
+  specFilterExpr,
+  CLOSE_REPLAY,
+  RESULTS_VIEW_STATE,
   runTabExpr,
   SPECS,
   networkListExpr,

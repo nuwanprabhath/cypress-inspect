@@ -39,6 +39,25 @@ function toTestResultsUrl(url) {
   return `${m[1]}/test-results`;
 }
 
+/*
+ * Return to the run's test-results view.
+ *
+ * Every filtering and listing call needs this first. Opening a Test Replay
+ * leaves the results list mounted behind the overlay, frozen on whichever filter
+ * was active at the time — so a status switch made from there reads the stale
+ * background list and returns the wrong tests entirely.
+ */
+async function ensureResultsView(cloud, { timeoutMs = 15000 } = {}) {
+  const state = await cloud.evaluate(probe.RESULTS_VIEW_STATE()).catch(() => null);
+  if (!state?.replayOpen) return { wasOpen: false };
+  const closed = await cloud.evaluate(probe.CLOSE_REPLAY()).catch(() => null);
+  const settled = await waitFor(async () => {
+    const s = await cloud.evaluate(probe.RESULTS_VIEW_STATE()).catch(() => null);
+    return s && !s.replayOpen && s.hasStatusLinks ? s : null;
+  }, { timeoutMs, pollMs: 400 });
+  return { wasOpen: true, closed: !!settled, detail: closed };
+}
+
 async function waitFor(fn, { timeoutMs = 30000, pollMs = 700 } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -105,6 +124,30 @@ async function listSpecs(cloud, { timeoutMs = 20000 } = {}) {
  * common case is "show me the failure". `spec` and `grep` are then applied here.
  */
 async function listTests(cloud, { status, spec, grep, limit = 200, scroll = true, timeoutMs = 20000 } = {}) {
+  const view = await ensureResultsView(cloud);
+
+  // Spec BEFORE status: narrowing to one spec first turns a 337-row scroll into
+  // single figures. Filtering by spec in JS after the fact does not work at run
+  // scale — the scrape has to reach the target rows before it can match them,
+  // and a partial read matches nothing at all.
+  let specFilter = null;
+  if (spec) {
+    specFilter = await cloud.evaluate(probe.specFilterExpr({
+      pattern: spec, openWaitMs: 900, applyWaitMs: 900,
+    }));
+    if (specFilter?.error === 'bad-spec-pattern') return { error: 'bad-spec-pattern', spec };
+    if (specFilter?.error === 'spec-not-found') {
+      return {
+        error: 'spec-not-found',
+        spec,
+        available: specFilter.available,
+        hint: 'No spec in this run matches that pattern. The list above is what the run actually contains.',
+      };
+    }
+    // If the UI filter is unavailable, fall through: the JS-side filter below
+    // still applies, just less reliably on a large run.
+  }
+
   let expectedCount = null;
   if (status) {
     const applied = await cloud.evaluate(probe.statusFilterExpr({ status }));
@@ -153,9 +196,13 @@ async function listTests(cloud, { status, spec, grep, limit = 200, scroll = true
    * the cause. Retry a couple of times, and if it still disagrees, SAY SO rather
    * than returning a list we know to be wrong.
    */
+  // Only reconcile when the status filter is the ONLY narrowing in play. With a
+  // spec filter also applied, the status link still reports the run-wide count
+  // (337 passed), so comparing against it would flag every correct per-spec read
+  // as a mismatch — a false alarm is as corrosive as a missed one.
   let countMismatch = null;
-  if (status && expectedCount != null) {
-    for (let attempt = 0; attempt < 3 && raw.scraped > expectedCount; attempt++) {
+  if (status && expectedCount != null && !spec) {
+    for (let attempt = 0; attempt < 3 && raw.scraped !== expectedCount; attempt++) {
       await new Promise((r) => setTimeout(r, 600));
       const retry = await scrapeOnce();
       if (!retry?.error) raw = retry;
@@ -185,6 +232,9 @@ async function listTests(cloud, { status, spec, grep, limit = 200, scroll = true
     filter: { status: status || null, spec: spec || null, grep: grep || null },
     matched,
     returned: Math.min(matched, limit),
+    ...(view.wasOpen ? { closedReplayFirst: true } : {}),
+    ...(specFilter && !specFilter.error ? { specFilterApplied: specFilter.selected } : {}),
+    ...(specFilter?.error ? { specFilterUnavailable: specFilter.error } : {}),
     ...(countMismatch ? { countMismatch } : {}),
     tests: tests.slice(0, limit).map((t, i) => ({ ...t, index: i })),
   };
@@ -206,24 +256,46 @@ async function openTestReplay(cloud, { index, grep, status, spec, timeoutMs = 45
   const pick = index != null ? listed.tests[index] : listed.tests[0];
   if (!pick) return { error: 'index-out-of-range', index, total: listed.tests.length };
 
-  // Re-find the row by title in the CURRENT DOM: the visible rows shift as the
-  // list scrolls, so a positional index from the scrape is not a DOM index.
+  /*
+   * Re-find the row in the CURRENT DOM before clicking — the visible rows shift
+   * as the list scrolls, so a positional index from the scrape is not a DOM
+   * index.
+   *
+   * Matching on the TITLE ALONE is not enough, and getting this wrong is silent
+   * and severe. Test titles repeat across specs whenever they come from shared
+   * helper commands: asking for `specify barcode to autofill trap ID` in
+   * vertebrate-trap-3 opened the identically-titled test in
+   * vertebrate-trap-2 — the tool then reported, and the agent then analysed,
+   * the wrong spec entirely. The spec path (and suite, when present) must match
+   * too, and if no row satisfies all of it, that is an error rather than a
+   * near-enough click.
+   */
   const clicked = await cloud.evaluate(`(() => {
     var wraps = Array.prototype.slice.call(document.querySelectorAll('[data-cy=parent-test-row-wrapper]'));
-    var want = ${JSON.stringify(pick.title)};
+    var wantTitle = ${JSON.stringify(pick.title)};
+    var wantSpec = ${JSON.stringify(pick.spec || '')};
+    var wantSuite = ${JSON.stringify(pick.suite || '')};
+    var seen = [];
     for (var i = 0; i < wraps.length; i++) {
       var frags = Array.prototype.slice.call(wraps[i].querySelectorAll('[data-cy=test-title-fragment]'))
         .map(function (f) { return (f.textContent || '').replace(/\\s+/g, ' ').trim(); }).filter(Boolean);
       var title = frags.length ? frags[frags.length - 1] : '';
-      if (title === want) {
-        var b = wraps[i].querySelector('[data-cy=artifact-controls_replay]');
-        if (!b) return { error: 'no-replay-button' };
-        wraps[i].scrollIntoView({ block: 'center' });
-        b.click();
-        return { clicked: true, title: title };
-      }
+      var suite = frags.length > 1 ? frags.slice(0, -1).join(' > ') : '';
+      // The spec path lives on the enclosing per-spec group, not the row.
+      var grp = wraps[i].closest ? wraps[i].closest('[data-cy^=RunTestResultRow-]') : null;
+      var pathEl = grp ? grp.querySelector('[data-cy=test-results__spec-path-container]') : null;
+      var spec = pathEl ? (pathEl.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+      seen.push({ spec: spec, suite: suite, title: title });
+      if (title !== wantTitle) continue;
+      if (wantSpec && spec && spec !== wantSpec) continue;
+      if (wantSuite && suite && suite !== wantSuite) continue;
+      var b = wraps[i].querySelector('[data-cy=artifact-controls_replay]');
+      if (!b) return { error: 'no-replay-button' };
+      wraps[i].scrollIntoView({ block: 'center' });
+      b.click();
+      return { clicked: true, title: title, spec: spec, suite: suite };
     }
-    return { error: 'row-not-rendered', want: want, rendered: wraps.length };
+    return { error: 'row-not-rendered', wantTitle: wantTitle, wantSpec: wantSpec, rendered: wraps.length, seen: seen.slice(0, 20) };
   })()`);
   if (clicked?.error) {
     return {
@@ -240,10 +312,15 @@ async function openTestReplay(cloud, { index, grep, status, spec, timeoutMs = 45
     return s?.replayOpen && s.hasScrubber && s.commandCount > 0 ? s : null;
   }, { timeoutMs });
 
+  const openedWrongTest = !!(state?.header && pick.title && !pick.title.includes(state.header) && !state.header.includes(pick.title));
   return {
-    ok: !!state,
+    ok: !!state && !openedWrongTest,
     test: pick,
+    clickedRow: clicked.clicked ? { spec: clicked.spec, suite: clicked.suite, title: clicked.title } : undefined,
     replay: state,
+    ...(openedWrongTest
+      ? { error: 'opened-wrong-test', hint: `The replay that opened is titled "${state.header}", not "${pick.title}". Titles repeat across specs; re-run narrowing with \`spec\` and \`grep\` together.` }
+      : {}),
     ...(state ? {} : { hint: 'The replay did not finish loading in time. Check `cloud_status`, then retry.' }),
   };
 }
