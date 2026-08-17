@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.16.0
+
+### Fixed
+- **Long console scrapes could silently lose rows.** The scrape advanced by a fixed
+  window each step. That is unsafe here because the panel *grows while you traverse it*
+  — measured live, `scrollHeight` went from 38,716px to 140,329px over a single pass as
+  rows materialised — so a fixed step can jump over rows that appear mid-list.
+  Reproduced in a test: rows 60-62 and 240-242 vanished at the growth boundaries. The
+  scrape now anchors each step on the **last row it actually rendered**, which cannot
+  skip; the cost is one row of overlap per step.
+- **Reaching the bottom was treated as being finished.** The loop sampled once and
+  stopped, but the list may have just grown taller in response to that very scroll,
+  leaving an unsampled tail. All three scrapes (console, network, run test list) now
+  require the scroll height to settle before stopping.
+- **A truncated console read looked like a complete short one.** Hitting the scroll-step
+  cap now reports `hitStepLimit` and prints a `⚠ INCOMPLETE` line. The default cap rose
+  from 600 to 2000 steps.
+- **`cloud_list_specs` could under-report without saying so.** It now also reads the
+  Specs tab's own badge and warns when the scrape came up short (seen once: 17 of 18).
+- **`cloud_open_run` reported a misleading `visibleTests: 0`.** That was rows mounted at
+  that instant — the counts arrive before the rows do — and next to `ok: true` it read
+  like an empty run. Renamed to `rowsMountedAtLoad`; `counts` is the real answer.
+
+### Changed
+- **Console/network/test-list scrapes are ~8× faster.** Each scroll step waited a flat
+  90 ms. Now it waits two animation frames — enough for React to commit the new window —
+  and only falls back to a real delay when that produced no new rows. Combined with the
+  anchoring above, a 773-row console went from **332 steps / 25.8 s to 57 steps / 3.3 s**,
+  returning the identical 773 rows.
+- Redundant per-step re-sampling removed (each window was scanned twice).
+
+### Notes
+A "jump to the end and read the last N rows" fast path was prototyped and **rejected**:
+because the list materialises progressively, jumping to the bottom exposes only the
+first few hundred rows, so it would have returned a silently-wrong tail. Verified by
+measurement — at the bottom of an un-traversed 773-row console, the highest row index
+present was 385.
+
 ## 0.15.0
 
 ### Fixed

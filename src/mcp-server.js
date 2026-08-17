@@ -260,7 +260,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.15.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.16.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without
@@ -1272,7 +1272,7 @@ async function runMcp() {
         maxScrollSteps: z.number().int().positive().max(2000).optional(),
       },
     },
-    async ({ grep, limit, maxScrollSteps = 600 } = {}) => {
+    async ({ grep, limit, maxScrollSteps = 2000 } = {}) => {
       const { cloud } = await ensureCloud();
       const result = await cloud.evaluate(cloudProbe.consoleExpr({
         grep: grep || null,
@@ -1291,7 +1291,12 @@ async function runMcp() {
         `# console: ${result.totalRows} rows on the panel, ${result.matchedRows} matched` +
         `${grep ? ` /${grep}/i` : ''}, showing ${result.returnedRows} ` +
         `(panel via ${result.panelVia}, strategy ${result.strategy}` +
-        `${result.consoleTab?.activated ? ', Console tab auto-selected' : ''}, ${result.scrollSteps} scroll steps)`;
+        `${result.consoleTab?.activated ? ', Console tab auto-selected' : ''}, ${result.scrollSteps} scroll steps)` +
+        // The panel materialises rows as it is scrolled, so a step cap means an
+        // INCOMPLETE console — which must never look like a complete short one.
+        (result.hitStepLimit
+          ? `\n⚠ INCOMPLETE: stopped at the ${maxScrollSteps}-step limit before reaching the end. Re-run with a higher \`maxScrollSteps\`.`
+          : '');
       if (!result.entries.length) {
         return textResult(
           `${header}\n(no rows)\n\n` +
@@ -1472,8 +1477,12 @@ async function runMcp() {
       if (result?.error) {
         return cloudProbeResult(result, { 'no-specs-tab': 'Open a run first with `cloud_open_run` or `cloud_open_ci_job`.' });
       }
-      return textResult(`# specs: ${result.total}\n` +
-        result.specs.map((s) => `[${String(s.index).padStart(3)}] ${s.spec}`).join('\n'));
+      const short = result.reportedByTab != null && result.reportedByTab !== result.total;
+      return textResult(
+        `# specs: ${result.total}` +
+        (result.reportedByTab != null ? ` (run reports ${result.reportedByTab})` : '') + '\n' +
+        result.specs.map((s) => `[${String(s.index).padStart(3)}] ${s.spec}`).join('\n') +
+        (short ? `\n\n⚠ Read ${result.total} of ${result.reportedByTab} — a row may not have mounted yet. Retry, or use \`cloud_list_tests\` which reports the run's own counts.` : ''));
     },
   );
 

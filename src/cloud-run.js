@@ -79,7 +79,10 @@ async function openRun(cloud, url, { timeoutMs = 45000 } = {}) {
       hint: 'The run\'s test-results list did not appear. Check `cloud_status` — if `looksLoggedOut` is true, sign in once in the debug browser window.',
     };
   }
-  return { ok: true, url: target, counts: ready.counts, visibleTests: ready.scraped };
+  // Deliberately NOT reporting a test count here: at this instant the list has
+  // usually rendered zero rows (counts arrive first), and a `visibleTests: 0`
+  // next to "ok: true" reads like an empty run. `counts` is the real answer.
+  return { ok: true, url: target, counts: ready.counts, rowsMountedAtLoad: ready.scraped };
 }
 
 async function listSpecs(cloud, { timeoutMs = 20000 } = {}) {

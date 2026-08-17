@@ -213,3 +213,67 @@ test('the scrubber lookup does not depend on a hashed CSS-module class', () => {
   assert.match(src, /data-cy/, 'should prefer a stable data-cy hook');
   assert.match(src, /1e12/, 'should have a structural epoch-ms fallback');
 });
+
+// ── scrape robustness ───────────────────────────────────────────────────────
+
+test('a virtualised list that grows while scrolling is still read completely', async () => {
+  // Measured live: the console panel's scrollHeight went from 38,716px to
+  // 140,329px over a single traversal, because rows materialise as you scroll.
+  // Two things follow, and both are load-bearing: the step count cannot be
+  // predicted up front, and jumping to the end is NOT a valid shortcut for
+  // reading the tail — only the first few hundred rows exist at that point.
+  const all = Array.from({ length: 400 }, (_, i) => `row ${i}`);
+  let revealed = 60; // only this many exist until scrolling pulls in more
+  const rowHeight = 20;
+  const clientHeight = 200;
+  let _top = 0;
+  const panel = {
+    // Browsers CLAMP scrollTop to [0, scrollHeight - clientHeight]. A fake that
+    // lets it run past the end renders nothing at the bottom and fails for a
+    // reason the real page never would.
+    get scrollTop() { return Math.max(0, Math.min(_top, this.scrollHeight - clientHeight)); },
+    set scrollTop(v) { _top = v; },
+    clientHeight,
+    get scrollHeight() { return revealed * rowHeight; },
+    querySelectorAll(sel) {
+      if (sel !== '[style]') return [];
+      const start = Math.floor(this.scrollTop / rowHeight);
+      const end = Math.min(revealed, start + Math.ceil(clientHeight / rowHeight) + 1);
+      const out = [];
+      for (let i = start; i < end; i++) {
+        out.push({
+          style: { position: 'absolute', top: `${i * rowHeight}px`, transform: '' },
+          innerText: all[i],
+          parentElement: rowParent,
+        });
+      }
+      // Approaching the current end reveals more, exactly as the real list does.
+      if (this.scrollTop + clientHeight >= revealed * rowHeight - 40) {
+        revealed = Math.min(all.length, revealed + 60);
+      }
+      return out;
+    },
+    get innerText() { return ''; },
+    contains: () => false,
+  };
+  const rowParent = { id: 'inner' };
+
+  const out = await runProbe(
+    probe.consoleExpr({ grep: null, limit: null, maxScrollSteps: 2000, stepDelayMs: 0, tabWaitMs: 0 }),
+    panel,
+  );
+  assert.equal(out.entries.length, all.length, 'every row must be reached despite the list growing');
+  assert.equal(out.grewWhileScraping, true, 'growth must be reported');
+  assert.equal(out.hitStepLimit, false);
+});
+
+test('hitting the step limit is reported, never passed off as a complete read', async () => {
+  const rows = Array.from({ length: 500 }, (_, i) => `row ${i}`);
+  const panel = makePanel({ rows, clientHeight: 200, rowHeight: 20 });
+  const out = await runProbe(
+    probe.consoleExpr({ grep: null, limit: null, maxScrollSteps: 3, stepDelayMs: 0, tabWaitMs: 0 }),
+    panel,
+  );
+  assert.equal(out.hitStepLimit, true, 'a truncated scrape must say so');
+  assert.ok(out.entries.length < rows.length);
+});

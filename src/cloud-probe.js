@@ -22,6 +22,49 @@ function expr(fn, ...args) {
   return `(${fn.toString()}).apply(null, ${JSON.stringify(args)})`;
 }
 
+/*
+ * Waiting for a virtualised list to render the next window.
+ *
+ * The scrapes used to sleep a flat 90 ms per scroll step. That is a guess in both
+ * directions: usually far longer than a render takes, and occasionally not long
+ * enough. It also compounds — the step size comes from the panel's VISIBLE
+ * height, which shrinks when the devtools drawer is small, so a long console
+ * needed hundreds of steps (measured: 427 steps for 773 rows, ~38 s of pure
+ * sleeping).
+ *
+ * Instead, wait two animation frames — enough for React to commit the new
+ * window — and only fall back to a real delay when that produced no new rows.
+ * Faster in the common case and self-correcting when the list genuinely lags.
+ */
+function frameWaitSrc() {
+  return `
+  function nextFrame() {
+    return new Promise(function (resolve) {
+      if (typeof requestAnimationFrame !== 'function') return setTimeout(resolve, 32);
+      requestAnimationFrame(function () { requestAnimationFrame(function () { resolve(); }); });
+    });
+  }
+  // Scroll one window, then wait only as long as the render actually needs.
+  // \`countFn\` returns how many distinct rows have been collected so far; if it
+  // has not moved after two frames, the list is still rendering, so back off.
+  async function scrollStep(el, countFn, sampleFn, fallbackMs) {
+    return scrollStepTo(el, Math.min(el.scrollTop + Math.floor(el.clientHeight * 0.9), el.scrollHeight),
+      countFn, sampleFn, fallbackMs);
+  }
+  // Scroll to an explicit position. Callers that can anchor on a row they have
+  // already rendered should use this — it cannot skip rows that appear mid-list.
+  async function scrollStepTo(el, top, countFn, sampleFn, fallbackMs) {
+    var before = countFn();
+    el.scrollTop = top;
+    await nextFrame();
+    sampleFn();
+    if (countFn() === before && fallbackMs > 0) {
+      await new Promise(function (r) { setTimeout(r, fallbackMs); });
+      sampleFn();
+    }
+  }`;
+}
+
 // ───────────────────────── shared page-side helpers ─────────────────────────
 // Inlined into each probe that needs them (probes cannot share scope). Kept as
 // source strings so they can be prepended inside the serialised function body.
@@ -638,15 +681,24 @@ async function runTestsProbe(opts) {
 
   if (scroller && opts.scroll) {
     scroller.scrollTop = 0;
-    await new Promise(function (r) { setTimeout(r, 250); });
+    await nextFrame();
     var last = -1;
     for (var i = 0; i < opts.maxScrollSteps; i++) {
       collectVisibleTests(found);
       var atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
-      if (atEnd || (scroller.scrollTop === last && i > 2)) { collectVisibleTests(found); break; }
+      if (atEnd || (scroller.scrollTop === last && i > 2)) {
+        // Same growth caveat as the console list — see consoleProbe.
+        var rh = scroller.scrollHeight;
+        collectVisibleTests(found);
+        await nextFrame();
+        collectVisibleTests(found);
+        if (scroller.scrollHeight === rh) break;
+        last = -1;
+        continue;
+      }
       last = scroller.scrollTop;
-      scroller.scrollTop = Math.min(scroller.scrollTop + Math.floor(scroller.clientHeight * 0.8), scroller.scrollHeight);
-      await new Promise(function (r) { setTimeout(r, opts.stepDelayMs); });
+      await scrollStep(scroller, function () { return found.size; },
+        function () { collectVisibleTests(found); }, opts.stepDelayMs);
     }
   }
 
@@ -663,7 +715,7 @@ async function runTestsProbe(opts) {
   };
 }
 
-const runTestsExpr = (opts) => exprWithHelpers(runTestsProbe, [runListSrc()], opts);
+const runTestsExpr = (opts) => exprWithHelpers(runTestsProbe, [frameWaitSrc(), runListSrc()], opts);
 
 // Apply the run's status filter by clicking its summary link — far cheaper than
 // scrolling 500 rows to find the one that failed, which is the usual goal.
@@ -700,7 +752,17 @@ const SPECS = () => `(() => {
     seen.push(p);
     out.push({ index: out.length, spec: p });
   }
-  return { total: out.length, specs: out, url: location.href };
+  // The tab's own badge ("Specs 18") is the authority. Reporting it lets a
+  // caller see when the scrape came up short — a long spec name rendered with
+  // an ellipsis, or a row not yet mounted, would otherwise silently vanish.
+  var tab = document.querySelector('[data-cy=run-tab-specs]');
+  var badge = tab ? parseInt((tab.textContent || '').replace(/[^0-9]/g, ''), 10) : NaN;
+  return {
+    total: out.length,
+    reportedByTab: isNaN(badge) ? null : badge,
+    specs: out,
+    url: location.href,
+  };
 })()`;
 
 // Cheap readiness poll: is a replay open, for which test, and how long is it?
@@ -778,12 +840,14 @@ async function consoleProbe(opts) {
   var textSnaps = [];
   var sawEventIds = false;
 
+  var maxSeenOff = 0;
   function sample() {
     var rows = virtualRows(el);
     for (var i = 0; i < rows.length; i++) {
       var text = (rows[i].innerText || '').replace(/\s+/g, ' ').trim();
       if (!text) continue;
       var off = offsetOf(rows[i]);
+      if (isFinite(off) && off > maxSeenOff) maxSeenOff = off;
       var ev = eventNode(rows[i]);
       var id = ev ? ev.getAttribute('data-cy-event-id') : null;
       var ts = ev ? Number(ev.getAttribute('data-cy-event-start')) : NaN;
@@ -796,18 +860,47 @@ async function consoleProbe(opts) {
   }
 
   el.scrollTop = 0;
-  await new Promise(function (r) { setTimeout(r, 200); });
+  await nextFrame();
 
+  // The list GROWS as it is traversed — measured going from 38,716px to
+  // 140,329px over one pass — because rows materialise progressively. Two
+  // consequences: the step count cannot be predicted up front, and jumping
+  // straight to the end is NOT a valid shortcut for reading the tail (only the
+  // first few hundred rows exist at that point). Every row has to be walked.
+  var startHeight = el.scrollHeight;
+  sample(); // the initial window; thereafter scrollStep samples each new one
   var last = -1;
   var steps = 0;
+  var hitStepLimit = true;
   for (var i = 0; i < opts.maxScrollSteps; i++) {
-    sample();
-    steps++;
     var atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
-    if (atEnd || (el.scrollTop === last && i > 2)) { sample(); break; }
+    if (atEnd || (el.scrollTop === last && i > 2)) {
+      // Reaching the bottom is NOT the same as being finished: the list may have
+      // just grown taller in response to this very scroll, leaving an unsampled
+      // tail below. Sample, give it a frame, and only stop once the height has
+      // actually settled — otherwise the end of a long console goes missing.
+      var h = el.scrollHeight;
+      sample();
+      await nextFrame();
+      sample();
+      if (el.scrollHeight === h) { hitStepLimit = false; break; }
+      last = -1;
+      continue;
+    }
     last = el.scrollTop;
-    el.scrollTop = Math.min(el.scrollTop + Math.floor(el.clientHeight * 0.7), el.scrollHeight);
-    await new Promise(function (r) { setTimeout(r, opts.stepDelayMs); });
+    // Resume from the LAST ROW ACTUALLY RENDERED rather than advancing by a
+    // fixed window. A fixed step can jump over rows that materialise mid-list as
+    // the panel grows (reproduced in tests: rows 60-62 and 240-242 vanished at
+    // the growth boundaries). Anchoring to a row we have really seen makes a gap
+    // impossible; the cost is one row of overlap per step.
+    // Anchor only when rows actually carry offsets. In the innerText-stitch
+    // fallback there are none, so maxSeenOff stays 0 and anchoring would inch
+    // forward one pixel at a time — there, step by a window as before.
+    var target = maxSeenOff > el.scrollTop
+      ? maxSeenOff
+      : Math.min(el.scrollTop + Math.floor(el.clientHeight * 0.9), el.scrollHeight);
+    await scrollStepTo(el, target, function () { return byKey.size; }, sample, opts.stepDelayMs);
+    steps++;
   }
 
   var entries, strategy;
@@ -861,8 +954,11 @@ async function consoleProbe(opts) {
     strategy: strategy,
     hasTimestamps: !!(bounds && sawEventIds),
     scrollHeight: el.scrollHeight,
+    startScrollHeight: startHeight,
+    grewWhileScraping: el.scrollHeight > startHeight,
     clientHeight: el.clientHeight,
     scrollSteps: steps,
+    hitStepLimit: hitStepLimit,
     totalRows: total,
     matchedRows: matched,
     returnedRows: entries.length,
@@ -871,7 +967,7 @@ async function consoleProbe(opts) {
 }
 
 const consoleExpr = (opts) =>
-  exprWithHelpers(consoleProbe, [findConsolePanelSrc()], opts);
+  exprWithHelpers(consoleProbe, [frameWaitSrc(), findConsolePanelSrc()], opts);
 
 // ───────────────────────────── network panel ─────────────────────────────
 /*
@@ -957,15 +1053,23 @@ async function networkListProbe(opts) {
   sample();
   if (scroller) {
     scroller.scrollTop = 0;
-    await new Promise(function (r) { setTimeout(r, 200); });
+    await nextFrame();
     var last = -1;
     for (var s = 0; s < opts.maxScrollSteps; s++) {
       sample();
       var atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
-      if (atEnd || (scroller.scrollTop === last && s > 2)) { sample(); break; }
+      if (atEnd || (scroller.scrollTop === last && s > 2)) {
+        // Same growth caveat as the console list — see consoleProbe.
+        var nh = scroller.scrollHeight;
+        sample();
+        await nextFrame();
+        sample();
+        if (scroller.scrollHeight === nh) break;
+        last = -1;
+        continue;
+      }
       last = scroller.scrollTop;
-      scroller.scrollTop = Math.min(scroller.scrollTop + Math.floor(scroller.clientHeight * 0.7), scroller.scrollHeight);
-      await new Promise(function (r) { setTimeout(r, opts.stepDelayMs); });
+      await scrollStep(scroller, function () { return byKey.size; }, sample, opts.stepDelayMs);
     }
   }
 
@@ -997,7 +1101,7 @@ async function networkListProbe(opts) {
   return { networkTab: tab, filterTab: opts.filterTab || 'all', total: items.length, scrolled: !!scroller, items: items };
 }
 
-const networkListExpr = (opts) => exprWithHelpers(networkListProbe, [networkSrc()], opts);
+const networkListExpr = (opts) => exprWithHelpers(networkListProbe, [frameWaitSrc(), networkSrc()], opts);
 
 /*
  * Expand one request and read its payload.
@@ -1075,7 +1179,7 @@ module.exports = {
   networkDetailExpr,
   // exported for unit tests
   _internals: {
-    withHelpers, findScrubberSrc, findAppFrameSrc, findConsolePanelSrc,
+    withHelpers, frameWaitSrc, findScrubberSrc, findAppFrameSrc, findConsolePanelSrc,
     commandsSrc, testsSrc, runListSrc, networkSrc,
   },
 };
