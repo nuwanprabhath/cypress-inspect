@@ -245,7 +245,34 @@ It is **fully isolated from `open` / `run`**: its own browser, its own session f
 be live at the same time and neither can clobber the other's CDP port. `--port` gives
 you a second, independent cloud browser; `CHROME_PATH` overrides browser discovery.
 
-**The loop it enables.** `cloud_console_logs` prefixes every line with the moment it
+**From a CI job link to the cause.** The pipeline failed and the evidence is in a
+Cypress Cloud recording somewhere. One flow gets you there:
+
+```
+cloud_open_ci_job { url: "https://gitlab.com/<group>/<project>/-/jobs/15922202335" }
+  # → run 12906: 1 failed, 519 passed, 12 pending
+
+cloud_open_test { status: "failed" }
+  # → basal-area-dbh-protocols.cy.js › basal 3 > basal 3 publish › submit
+
+cloud_get_failure
+  # → "Historical data count in Dexie for table responses did not reach
+  #    expected count of 4 within timeout", stack, and the failing command
+
+cloud_network_logs { failedOnly: true }     # what the backend said
+cloud_console_logs { grep: "my-marker" }    # what the app logged
+```
+
+`cloud_open_ci_job` needs [`glab`](https://gitlab.com/gitlab-org/cli) installed and
+authenticated (`glab auth login`) — it reuses that rather than storing a second
+credential. If you'd rather not, fetch the job log yourself and pass it to
+`cloud_open_run { text }`, which extracts the run URL from any log output.
+
+⚠ `cloud_network_detail` returns request headers verbatim, **including `Authorization`
+bearer tokens**. That is the point of the tool, but take care pasting its output into
+issues or chats.
+
+**The console loop.** `cloud_console_logs` prefixes every line with the moment it
 fired and a ready-to-use timeline fraction, so finding a log and *seeing the app at
 that instant* is two calls:
 
@@ -265,7 +292,14 @@ into the run".
 
 | Tool | Use |
 | --- | --- |
-| `cloud_status` | Browser alive? Which page? Is it a drivable replay (`isReplay`)? Signed in (`looksLoggedOut`, `authHost`)? **Start here.** |
+| `cloud_open_ci_job` `{ url }` | **A GitLab job URL → the failing test.** Reads the job log via `glab`, extracts the Cypress run URL, opens the run. |
+| `cloud_open_run` `{ url? \| text? }` | Open a run by URL, or extract one from a blob of CI log output. |
+| `cloud_list_specs` | Every spec file in the run. |
+| `cloud_open_test` `{ status? , spec?, grep?, index? }` | Open a test's replay from the run — `{ status: "failed" }` opens the first failure. |
+| `cloud_get_failure` | Error message, stack trace, and the command that failed. |
+| `cloud_network_logs` `{ failedOnly?, fetchXhrOnly?, grep?, offset?, limit? }` | Recorded requests: time, method, status, path, each with a seekable `fraction`. |
+| `cloud_network_detail` `{ rowId }` | One request's headers and request/response payloads. |
+| `cloud_status` | Browser alive? Which page? Is it a drivable replay (`isReplay`)? Signed in (`looksLoggedOut`, `authHost`)? |
 | `cloud_open` `{ url }` | Navigate to a Test Replay link and wait for the timeline to hydrate. |
 | `cloud_console_logs` `{ grep?, limit?, maxScrollSteps? }` | The recorded console output. Selects the Console tab for you and scrolls the virtualised list end to end. `grep` is a case-insensitive regex; omit for everything. Each line carries `[<sec> f=<fraction>]`. |
 | `cloud_timeline` | Scrubber bounds + position (`durationSec`, `positionSec`, `fraction`) and the app frame's scroll metrics. |

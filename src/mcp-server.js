@@ -11,6 +11,9 @@ const { CloudCdp } = require('./cloud-cdp');
 const cloudProbe = require('./cloud-probe');
 const { seekReplay } = require('./cloud-seek');
 const cloudCommands = require('./cloud-commands');
+const cloudRun = require('./cloud-run');
+const cloudNetwork = require('./cloud-network');
+const ciLinks = require('./ci-links');
 
 async function runMcp() {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -257,7 +260,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.14.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.15.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without
@@ -1398,6 +1401,157 @@ async function runMcp() {
   );
 
   server.registerTool(
+    'cloud_open_ci_job',
+    {
+      title: 'Open the Cypress Cloud run for a CI job',
+      description: 'Give it a GitLab job URL (…/-/jobs/12345678) and it reads the job log via the `glab` CLI, extracts the Cypress Cloud run URL Cypress printed there, and opens that run\'s test-results view. This is the entry point for "the pipeline failed, go look": follow with `cloud_list_tests { status: "failed" }` → `cloud_open_test` → `cloud_get_failure` / `cloud_console_logs` / `cloud_network_logs`. Requires `glab` installed and authenticated (`glab auth login`); if it is not, this reports exactly that — fetch the log yourself and use `cloud_open_run { text }` instead.',
+      annotations: { readOnlyHint: false },
+      inputSchema: { url: z.string() },
+    },
+    async ({ url }) => {
+      const found = await ciLinks.findRunUrlForCiJob(url);
+      if (found.error) return textResult(JSON.stringify(found, null, 2));
+      const { cloud } = await ensureCloud();
+      const opened = await cloudRun.openRun(cloud, found.url);
+      return textResult(JSON.stringify({
+        job: found.job,
+        foundRunUrl: found.url,
+        ...(found.allUrls.length > 1 ? { otherUrlsInLog: found.allUrls.slice(1) } : {}),
+        opened,
+        ...(opened.ok ? { hint: 'Run loaded. Call `cloud_list_tests { status: "failed" }` to jump to the failures.' } : {}),
+      }, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'cloud_open_run',
+    {
+      title: 'Open a Cypress Cloud run',
+      description: 'Open a run\'s test-results view. Pass `url` (a run URL, or any replay URL for that run — it is normalised to the run), or `text` (a blob of CI log output to extract the run URL from, ANSI codes and all). A bare run URL redirects to /overview, which contains no test rows, so this always lands on /test-results where the filters and tests live.',
+      annotations: { readOnlyHint: false },
+      inputSchema: {
+        url: z.string().optional(),
+        text: z.string().optional(),
+      },
+    },
+    async ({ url, text } = {}) => {
+      let target = url;
+      let extracted = null;
+      if (!target && text) {
+        const urls = ciLinks.extractRunUrls(text);
+        if (!urls.length) {
+          return textResult(JSON.stringify({
+            error: 'no-cypress-url-in-text',
+            hint: 'No cloud.cypress.io run URL found in that text. Cypress only prints one when the run was recorded (`--record`).',
+          }, null, 2));
+        }
+        target = urls[0];
+        extracted = urls;
+      }
+      if (!target) return textResult('Pass either `url` (a Cypress Cloud run URL) or `text` (CI log output to extract one from).');
+      const { cloud } = await ensureCloud();
+      const opened = await cloudRun.openRun(cloud, target);
+      return textResult(JSON.stringify({
+        ...(extracted ? { extractedFromText: extracted } : {}),
+        ...opened,
+      }, null, 2));
+    },
+  );
+
+  server.registerTool(
+    'cloud_list_specs',
+    {
+      title: 'List the spec files in this run',
+      description: 'Every spec file the run executed, from the run\'s Specs tab. Use it to pick a spec, then narrow the tests with `cloud_list_tests { spec: "<pattern>" }`.',
+      annotations: READ,
+      inputSchema: {},
+    },
+    async () => {
+      const { cloud } = await ensureCloud();
+      const result = await cloudRun.listSpecs(cloud);
+      if (result?.error) {
+        return cloudProbeResult(result, { 'no-specs-tab': 'Open a run first with `cloud_open_run` or `cloud_open_ci_job`.' });
+      }
+      return textResult(`# specs: ${result.total}\n` +
+        result.specs.map((s) => `[${String(s.index).padStart(3)}] ${s.spec}`).join('\n'));
+    },
+  );
+
+  server.registerTool(
+    'cloud_open_test',
+    {
+      title: 'Open a test\'s replay from the run list',
+      description: 'Pick a test out of the run and open its Test Replay, ready for `cloud_get_commands` / `cloud_console_logs` / `cloud_network_logs` / `cloud_screenshot`. Narrow with the same filters as `cloud_list_tests` (`status`, `spec`, `grep`) and pick with `index` into that filtered list — `{ status: "failed" }` alone opens the first failure, which is usually what you want. Waits for the replay to finish loading and reports `ok`.',
+      annotations: { readOnlyHint: false },
+      inputSchema: {
+        status: z.enum(['failed', 'passed', 'pending', 'skipped']).optional(),
+        spec: z.string().optional(),
+        grep: z.string().optional(),
+        index: z.number().int().min(0).optional(),
+        timeoutMs: z.number().int().min(1000).max(180000).optional(),
+      },
+    },
+    async (args = {}) => {
+      const { cloud } = await ensureCloud();
+      const result = await cloudRun.openTestReplay(cloud, args);
+      return cloudProbeResult(result, {
+        'no-matching-test': 'Nothing matched those filters — call `cloud_list_tests` to see what the run contains.',
+        'index-out-of-range': 'That index does not exist in the filtered list.',
+        'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
+      });
+    },
+  );
+
+  server.registerTool(
+    'cloud_network_logs',
+    {
+      title: 'Read the replay\'s network activity',
+      description: 'Recorded requests for the test being replayed: time, method, status and path, one line each. Filters: `failedOnly` (4xx/5xx — uses the panel\'s own Errors tab), `fetchXhrOnly` (skip images/assets), `grep` (regex over method + path + status), `offset`/`limit`. Each row carries `[<sec> f=<fraction>]`, so you can `cloud_seek { fraction }` to the moment a request fired. Rows are listed compactly on purpose — pass a row\'s `rowId` to `cloud_network_detail` for headers and payloads.',
+      annotations: READ,
+      inputSchema: {
+        grep: z.string().optional(),
+        failedOnly: z.boolean().optional(),
+        fetchXhrOnly: z.boolean().optional(),
+        offset: z.number().int().min(0).optional(),
+        limit: z.number().int().positive().max(500).optional(),
+      },
+    },
+    async (args = {}) => {
+      const { cloud } = await ensureCloud();
+      const result = await cloudNetwork.listNetwork(cloud, args);
+      if (result?.error) {
+        return cloudProbeResult(result, {
+          'no-network-rows': 'No requests in the replay\'s Network panel. Either this test made none, or no replay is open — check `cloud_status`.',
+          'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
+        });
+      }
+      const header = `# network: ${result.total} recorded, ${result.matched} matched, showing ${result.returned} (filter tab: ${result.filterTab})`;
+      const lines = result.items.map((i) =>
+        `${i.tSec != null ? `[${String(i.tSec).padStart(6)}s f=${i.fraction}] ` : ''}` +
+        `${(i.status || '---').padStart(3)} ${(i.method || '').padEnd(6)} ${(i.path || '').slice(0, 120)}   (${i.rowId})`);
+      return textResult(`${header}\n${lines.join('\n') || '(none matched)'}` +
+        (result.matched ? '\n\nPass a `rowId` to `cloud_network_detail` for headers and payloads.' : ''));
+    },
+  );
+
+  server.registerTool(
+    'cloud_network_detail',
+    {
+      title: 'Read one request\'s headers and payload',
+      description: 'Expand a single recorded request and return its request URL/method/headers and its response headers and body. Address it by `rowId` from `cloud_network_logs` (e.g. "devtool-network-item-19") — NOT a positional index, because the network list is virtualised and positions shift as it scrolls. If Cypress Cloud declines to render an oversized body, that is reported as `bodyTooLarge` rather than an empty payload.',
+      annotations: READ,
+      inputSchema: { rowId: z.string() },
+    },
+    async ({ rowId }) => {
+      const { cloud } = await ensureCloud();
+      const result = await cloudNetwork.networkDetail(cloud, { rowId });
+      return cloudProbeResult(result, {
+        'row-not-rendered': 'That row is not currently in the DOM — re-run `cloud_network_logs` and use a rowId from the fresh list.',
+      });
+    },
+  );
+
+  server.registerTool(
     'cloud_get_commands',
     {
       title: 'List the replay command log',
@@ -1425,6 +1579,26 @@ async function runMcp() {
         `[${String(c.index).padStart(3)}] ${(c.number || '').padStart(4)} ${c.state === 'failed' ? 'FAIL' : c.state === 'pending' ? 'pend' : '    '} ` +
         `${(c.method || '').padEnd(16)} ${(c.message || '').slice(0, 110)}${c.isPinned ? '   ← PINNED' : ''}`);
       return textResult(`${header}\n${lines.join('\n') || '(none matched)'}`);
+    },
+  );
+
+  server.registerTool(
+    'cloud_get_failure',
+    {
+      title: 'Why did this test fail?',
+      description: 'The failure of the test being replayed: error message, stack trace, and the command it failed on. Start here after `cloud_open_test { status: "failed" }`. Note `autoLoggedNetworkFailures` — Cypress stamps "failed" on auto-logged network rows too, so the first red row in the log is often an unrelated request; this picks the last failed row that is NOT a network row, and lists the network ones separately rather than hiding them.',
+      annotations: READ,
+      inputSchema: {},
+    },
+    async () => {
+      const { cloud } = await ensureCloud();
+      const result = await cloud.evaluate(cloudProbe.FAILURE());
+      if (result?.error) {
+        return cloudProbeResult(result, {
+          'no-failure-found': 'No error message or failed command in this replay — the test may have passed. Check `cloud_list_tests { status: "failed" }`.',
+        });
+      }
+      return textResult(JSON.stringify(result, null, 2));
     },
   );
 
@@ -1461,21 +1635,34 @@ async function runMcp() {
     'cloud_list_tests',
     {
       title: 'List the tests in this run',
-      description: 'Every test in the run\'s results drawer, with `index` (pass to `cloud_select_test`), `suite`, `title` and `status` (passed/failed/pending/skipped). Use this to move to another test in the same run without pasting a new replay URL.',
+      description: 'Tests in the run, with `spec`, `suite`, `title` and `status`. ⚠ The run\'s list is VIRTUALISED — a 500-test run keeps ~15 rows in the DOM — so ALWAYS narrow rather than reading everything: `status` (applied via the run\'s own summary links, exact and cheap; `{ status: "failed" }` is the usual starting point), `spec` (regex on the spec path), `grep` (regex on suite + title). The response reports the run\'s true `counts` next to how many were `scraped`, so a truncated read is always visible. Pick one with `cloud_open_test`.',
       annotations: READ,
-      inputSchema: {},
+      inputSchema: {
+        status: z.enum(['failed', 'passed', 'pending', 'skipped']).optional(),
+        spec: z.string().optional(),
+        grep: z.string().optional(),
+        limit: z.number().int().positive().max(1000).optional(),
+        scroll: z.boolean().optional(),
+      },
     },
-    async () => {
+    async (args = {}) => {
       const { cloud } = await ensureCloud();
-      const result = await cloudCommands.listTests(cloud);
+      const result = await cloudRun.listTests(cloud, args);
       if (result?.error) {
         return cloudProbeResult(result, {
-          'no-test-rows': 'No test rows found. This page may not be a run\'s test-results view — check `cloud_status`.',
+          'no-test-rows': 'No test rows found. Open a run first with `cloud_open_run` / `cloud_open_ci_job` — a bare run URL lands on /overview, which has none.',
+          'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
+          'bad-spec-pattern': 'The `spec` value is not a valid JavaScript regular expression.',
         });
       }
+      const counts = Object.entries(result.counts || {}).map(([k, v]) => `${v} ${k}`).join(', ');
+      const header = `# tests: run has ${counts || 'unknown counts'}; scraped ${result.scraped}` +
+        `${result.scrolled ? ' (scrolled)' : ' (no scroll)'}, matched ${result.matched}, showing ${result.returned}` +
+        `  filter: ${JSON.stringify(result.filter)}`;
       const lines = result.tests.map((t) =>
-        `[${String(t.index).padStart(3)}] ${(t.status || '?').padEnd(8)} ${t.suite ? t.suite + ' › ' : ''}${t.title}`);
-      return textResult(`# tests: ${result.total}\n${lines.join('\n')}`);
+        `[${String(t.index).padStart(3)}] ${(t.status || '?').padEnd(8)} ${t.spec ? t.spec.split('/').pop() + ' › ' : ''}` +
+        `${t.suite ? t.suite + ' › ' : ''}${t.title}`);
+      return textResult(`${header}\n${lines.join('\n') || '(none matched)'}`);
     },
   );
 

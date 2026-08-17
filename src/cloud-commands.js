@@ -10,6 +10,14 @@
 
 const probe = require('./cloud-probe');
 
+// Test each field as well as the joined string: matching only the joined form
+// breaks anchored patterns (`^click$` against "click submit" never matches).
+function matchesAny(re, fields) {
+  const parts = fields.filter((f) => f != null && f !== '');
+  if (parts.some((f) => re.test(f))) return true;
+  return re.test(parts.join(' '));
+}
+
 // Resolve "which command did the caller mean" from any of three ways of saying
 // it. Returns { index } or { error, ... } with enough context to fix the call.
 function resolveCommand(commands, { index, number, grep }) {
@@ -30,7 +38,7 @@ function resolveCommand(commands, { index, number, grep }) {
   if (grep) {
     let re;
     try { re = new RegExp(grep, 'i'); } catch { return { error: 'bad-grep', grep }; }
-    const hits = commands.filter((c) => re.test(`${c.method || ''} ${c.message || ''}`));
+    const hits = commands.filter((c) => matchesAny(re, [c.method, c.message]));
     if (!hits.length) return { error: 'grep-no-match', grep };
     return { index: hits[0].index, matched: hits.length, matches: hits.slice(0, 10) };
   }
@@ -43,7 +51,7 @@ function filterCommands(commands, { grep, failedOnly, offset = 0, limit = 100 })
   if (grep) {
     let re;
     try { re = new RegExp(grep, 'i'); } catch { return { error: 'bad-grep', grep }; }
-    out = out.filter((c) => re.test(`${c.method || ''} ${c.message || ''}`));
+    out = out.filter((c) => matchesAny(re, [c.method, c.message]));
   }
   const matched = out.length;
   return { matched, page: out.slice(offset, offset + limit) };
@@ -123,7 +131,7 @@ function resolveTest(tests, { index, grep }) {
   if (grep) {
     let re;
     try { re = new RegExp(grep, 'i'); } catch { return { error: 'bad-grep', grep }; }
-    const hits = tests.filter((t) => re.test(`${t.suite || ''} ${t.title || ''}`));
+    const hits = tests.filter((t) => matchesAny(re, [t.title, t.suite]));
     if (!hits.length) return { error: 'grep-no-match', grep };
     if (hits.length > 1) return { index: hits[0].index, matched: hits.length, matches: hits.slice(0, 10) };
     return { index: hits[0].index };

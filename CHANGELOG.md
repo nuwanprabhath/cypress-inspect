@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.15.0
+
+### Fixed
+- **`cloud_list_tests` silently truncated big runs.** It read the test rows in one
+  pass, which was correct on the 24-test run it was built against — but the run list
+  is **virtualised**, so a 532-test run keeps about 15 rows in the DOM. The tool
+  reported 15 tests and an agent would reasonably conclude the other 517 did not
+  exist. It now narrows with the run's own filters first, scrolls when it must, and
+  always reports the run's true `counts` beside how many it `scraped`, so a partial
+  read is impossible to mistake for a short run.
+- **`grep` could not match with an anchor.** Patterns were tested against the
+  concatenation of the fields, so `^submit$` against a test titled "submit" matched
+  nothing — the haystack was "basal 3 > publish submit". Every `grep` now tests each
+  field individually as well as the joined form. Applies to `cloud_list_tests`,
+  `cloud_get_commands`, `cloud_step_to` and `cloud_select_test`.
+
+### Added
+- **From a CI job link to the failing test, in one flow.** The whole point: a pipeline
+  failed, and the evidence is in a Cypress Cloud recording you have to go and find.
+
+  ```
+  cloud_open_ci_job { url: "https://gitlab.com/<group>/<project>/-/jobs/15922202335" }
+  cloud_list_tests  { status: "failed" }
+  cloud_open_test   { status: "failed" }
+  cloud_get_failure
+  cloud_console_logs { grep: "…" } | cloud_network_logs { failedOnly: true }
+  ```
+
+  | Tool | Use |
+  |---|---|
+  | `cloud_open_ci_job` | GitLab job URL → reads the log via `glab` → opens the Cypress run |
+  | `cloud_open_run` | Open a run by URL, or extract one from a blob of CI log `text` |
+  | `cloud_list_specs` | Every spec file in the run |
+  | `cloud_open_test` | Open a test's replay, filtered by `status` / `spec` / `grep` |
+  | `cloud_get_failure` | Error message, stack, and the command that failed |
+  | `cloud_network_logs` | Recorded requests: time, method, status, path |
+  | `cloud_network_detail` | One request's headers and payloads |
+
+### Notes on the implementation
+- **CI logs are ANSI-coloured, and the escape codes land inside the URL match.** A
+  naive regex over a GitLab trace yields `…/runs/12906?[0m` — a URL that reads
+  correctly in a log and 404s in a browser. Codes are stripped before matching, the
+  several mentions in a log collapse to one, and the most specific form wins so a
+  replay link is preferred over a run overview.
+- **`glab` is an optional dependency, used because you already have it authenticated**
+  (including for self-hosted GitLab), so this tool stores no second credential. Every
+  failure — not installed, not logged in, no access, no Cypress URL in the log — is
+  reported distinctly, because "no output" from an auth problem otherwise looks
+  identical to "this job never ran Cypress".
+- **A bare run URL redirects to `/overview`, which contains no test rows at all**, so
+  every entry point normalises to `/test-results` where the filters and tests live.
+- **`status` is applied by clicking the run's own summary link** ("1 failed") rather
+  than by scraping and filtering — exact, and it turns a 532-row scroll into one click.
+- **Network rows carry the same `data-cy-event-start` timestamps as console rows**, so
+  each request gets a seekable `fraction`: find the request that 500'd, then
+  `cloud_seek` to it and screenshot the app at that moment.
+- **Network rows are addressed by `rowId`, not position.** That list is virtualised too,
+  so position N in an earlier listing is not position N in the DOM now — an index would
+  quietly return a different request's payload.
+- **`cloud_get_failure` avoids the auto-logged-network trap.** Cypress stamps
+  `command-state-failed` on auto-logged network rows, so the first red row is often an
+  unrelated request — verified live, where a failing test's first "failed" row was a
+  `(fetch)` POST that returned **200**. It takes the last failed row that is not a
+  network row, and reports the network ones separately rather than hiding them.
+- Everything in the devtools panels reads `textContent`, not `innerText`: those panels
+  are tab-switched and `innerText` returns `''` for anything not currently rendered,
+  which produced a full list of blank rows during development.
+
+### Verified
+End to end against a real job: `…/-/jobs/15922202335` → run 12906 (532 tests, 18 specs,
+1 failure) → the failing test's replay → its error ("Historical data count in Dexie for
+table responses did not reach expected count of 4 within timeout"), stack, failed
+command, and both its failed requests with full JSON payloads. 167 tests pass.
+
+### ⚠ Note on payloads
+`cloud_network_detail` returns request headers verbatim, which includes `Authorization`
+bearer tokens. That is the point of the tool, but be careful about pasting its output
+into issues or chats.
+
 ## 0.14.0
 
 ### Added

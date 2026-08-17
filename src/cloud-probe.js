@@ -429,6 +429,83 @@ async function pinCommandProbe(opts) {
 
 const pinCommandExpr = (opts) => exprWithHelpers(pinCommandProbe, [commandsSrc()], opts);
 
+/*
+ * The failure: message, stack, and the command it happened on.
+ *
+ * Choosing the failed command needs care. Cypress stamps `command-state-failed`
+ * on auto-logged network rows whose request failed, so the FIRST failed row is
+ * often an unrelated resource — the local runner hit exactly this and it
+ * misdirected every downstream tool. Measured on a live Cloud replay, the same
+ * thing happens: a failing test showed two "failed" rows, the first being a
+ * `(fetch)` POST that returned 200. So: take the LAST failed row that is not a
+ * network row, and only fall back to a network row when it is the sole
+ * candidate (a genuinely failing request really can be the failure).
+ */
+async function failureProbe() {
+  /*__HELPERS__*/
+  var msgEl = document.querySelector('.runnable-err-message, [class*="runnable-err-message"]');
+
+  // The stack sits inside a collapsible, and `.runnable-err-stack-expander`
+  // is the HEADER, not the content — selecting it yields the literal string
+  // "Stack trace Print to console" instead of a stack, which looks like data.
+  // Expand if collapsed, then read the wrapper and strip the header labels.
+  var expander = document.querySelector('.runnable-err-stack-expander, [class*="runnable-err-stack"]');
+  var header = expander ? expander.querySelector('[aria-expanded]') : null;
+  if (header && header.getAttribute('aria-expanded') === 'false') {
+    header.click();
+    await new Promise(function (r) { setTimeout(r, 300); });
+    expander = document.querySelector('.runnable-err-stack-expander, [class*="runnable-err-stack"]');
+  }
+  // Walk up from the PARENT, matching the exact `collapsible` class token.
+  // `closest('[class*="collapsible"]')` matches the expander itself — its class
+  // is `collapsible-header-wrapper` — which yields only the header labels and,
+  // once those are stripped, an empty string masquerading as "no stack".
+  var wrap = null;
+  var node = expander ? expander.parentElement : null;
+  while (node && !wrap) {
+    if ((' ' + (node.className || '') + ' ').indexOf(' collapsible ') !== -1) wrap = node;
+    node = node.parentElement;
+  }
+  var stackText = null;
+  if (wrap) {
+    stackText = (wrap.textContent || '').replace(/\s+/g, ' ')
+      .replace(/^\s*Stack trace\s*/i, '')
+      .replace(/^\s*Print to console\s*/i, '')
+      .trim();
+    if (!stackText) stackText = null;
+  }
+  var rows = cmdRows();
+
+  var failed = [];
+  for (var i = 0; i < rows.length; i++) {
+    if (cmdState(rows[i]) === 'failed') failed.push(i);
+  }
+  var isNetworkish = function (i) {
+    var info = cmdInfo(rows[i], i);
+    return /^\(?(fetch|xhr|request)\)?$/i.test(info.method || '')
+      || /^https?:\/\//.test(info.message || '');
+  };
+  var chosen = -1;
+  for (var k = failed.length - 1; k >= 0; k--) {
+    if (!isNetworkish(failed[k])) { chosen = failed[k]; break; }
+  }
+  if (chosen === -1 && failed.length) chosen = failed[failed.length - 1];
+
+  if (!msgEl && chosen === -1) {
+    return { error: 'no-failure-found', commandCount: rows.length };
+  }
+  return {
+    message: msgEl ? (msgEl.textContent || '').replace(/\s+/g, ' ').trim() : null,
+    stack: stackText,
+    failedCommand: chosen >= 0 ? cmdInfo(rows[chosen], chosen) : null,
+    allFailedIndexes: failed,
+    autoLoggedNetworkFailures: failed.filter(isNetworkish),
+    commandCount: rows.length,
+  };
+}
+
+const FAILURE = () => exprWithHelpers(failureProbe, [commandsSrc()]);
+
 // ───────────────────── test list (switch which test replays) ─────────────────
 
 function testsSrc() {
@@ -482,6 +559,149 @@ function selectTestProbe(opts) {
 }
 
 const selectTestExpr = (opts) => exprWithHelpers(selectTestProbe, [testsSrc()], opts);
+
+// ───────────────────── run level: specs, tests, filters ─────────────────────
+/*
+ * The run's test-results list is VIRTUALISED, and on a big run that is not a
+ * detail — a 532-test run renders 15 rows, so a single-pass read reports 15
+ * tests and an agent concludes the other 517 do not exist. Anything reading this
+ * list must scroll it.
+ *
+ * Rows are grouped per spec (`RunTestResultRow-N`, N = spec index) with the tests
+ * inside, so `group index + title` is a stable identity across scroll positions.
+ */
+function runListSrc() {
+  return `
+  function resultsScroller() {
+    var cands = Array.prototype.slice.call(document.querySelectorAll('.stacked-layout--content, [class*="stacked-layout"]'))
+      .filter(function (e) { return e.scrollHeight > e.clientHeight + 50; });
+    if (cands.length) return cands[0];
+    var all = Array.prototype.slice.call(document.querySelectorAll('*')).filter(function (e) {
+      return e.scrollHeight > e.clientHeight + 100 && e.clientHeight > 200;
+    });
+    var best = null;
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].querySelector('[data-cy=parent-test-row-wrapper], [data-cy^=RunTestResultRow-]')) { best = all[i]; break; }
+    }
+    return best;
+  }
+  function statusOf(w) {
+    var icon = w.querySelector('[data-cy$="-icon"], [data-cy^="status-icon-"]');
+    return icon ? (icon.getAttribute('data-cy') || '').replace(/(^status-icon-|-icon$)/g, '') : null;
+  }
+  function collectVisibleTests(into) {
+    var groups = Array.prototype.slice.call(document.querySelectorAll('[data-cy^=RunTestResultRow-]'));
+    for (var g = 0; g < groups.length; g++) {
+      var grp = groups[g];
+      var gi = Number((grp.getAttribute('data-cy') || '').replace('RunTestResultRow-', ''));
+      var pathEl = grp.querySelector('[data-cy=test-results__spec-path-container]');
+      var spec = pathEl ? (pathEl.textContent || '').replace(/\\s+/g, ' ').trim() : null;
+      var wraps = Array.prototype.slice.call(grp.querySelectorAll('[data-cy=parent-test-row-wrapper]'));
+      for (var t = 0; t < wraps.length; t++) {
+        var w = wraps[t];
+        var frags = Array.prototype.slice.call(w.querySelectorAll('[data-cy=test-title-fragment]'))
+          .map(function (f) { return (f.textContent || '').replace(/\\s+/g, ' ').trim(); })
+          .filter(Boolean);
+        var title = frags.length ? frags[frags.length - 1] : (w.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+        if (!title) continue;
+        var key = gi + '|' + title;
+        if (!into.has(key)) {
+          into.set(key, {
+            specIndex: gi,
+            spec: spec,
+            suite: frags.length > 1 ? frags.slice(0, -1).join(' > ') : null,
+            title: title,
+            status: statusOf(w),
+            hasReplay: !!w.querySelector('[data-cy=artifact-controls_replay]'),
+          });
+        }
+      }
+    }
+  }
+  // Counts straight off the run's own summary links, so a caller can always
+  // tell a truncated scrape from a genuinely short list.
+  function runCounts() {
+    var out = {};
+    ['failed', 'passed', 'pending', 'skipped'].forEach(function (k) {
+      var e = document.querySelector('[data-cy=link-' + k + ']');
+      if (e) { var n = parseInt((e.textContent || '').replace(/[^0-9]/g, ''), 10); if (!isNaN(n)) out[k] = n; }
+    });
+    return out;
+  }`;
+}
+
+async function runTestsProbe(opts) {
+  /*__HELPERS__*/
+  var scroller = resultsScroller();
+  var found = new Map();
+  collectVisibleTests(found);
+
+  if (scroller && opts.scroll) {
+    scroller.scrollTop = 0;
+    await new Promise(function (r) { setTimeout(r, 250); });
+    var last = -1;
+    for (var i = 0; i < opts.maxScrollSteps; i++) {
+      collectVisibleTests(found);
+      var atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+      if (atEnd || (scroller.scrollTop === last && i > 2)) { collectVisibleTests(found); break; }
+      last = scroller.scrollTop;
+      scroller.scrollTop = Math.min(scroller.scrollTop + Math.floor(scroller.clientHeight * 0.8), scroller.scrollHeight);
+      await new Promise(function (r) { setTimeout(r, opts.stepDelayMs); });
+    }
+  }
+
+  var tests = Array.from(found.values()).sort(function (a, b) {
+    return a.specIndex - b.specIndex;
+  }).map(function (t, i) { return Object.assign({ index: i }, t); });
+
+  return {
+    scraped: tests.length,
+    scrolled: !!(scroller && opts.scroll),
+    hadScroller: !!scroller,
+    counts: runCounts(),
+    tests: tests,
+  };
+}
+
+const runTestsExpr = (opts) => exprWithHelpers(runTestsProbe, [runListSrc()], opts);
+
+// Apply the run's status filter by clicking its summary link — far cheaper than
+// scrolling 500 rows to find the one that failed, which is the usual goal.
+function statusFilterProbe(opts) {
+  /*__HELPERS__*/
+  var link = document.querySelector('[data-cy=link-' + opts.status + ']');
+  if (!link) return { error: 'no-status-link', status: opts.status, counts: runCounts() };
+  var count = parseInt((link.textContent || '').replace(/[^0-9]/g, ''), 10);
+  link.click();
+  return { clicked: true, status: opts.status, expected: isNaN(count) ? null : count };
+}
+
+const statusFilterExpr = (opts) => exprWithHelpers(statusFilterProbe, [runListSrc()], opts);
+
+// Click one of the run's top-level tabs (overview / test-results / specs / errors).
+const runTabExpr = (tab) => `(() => {
+  var el = document.querySelector('[data-cy=run-tab-${tab}]');
+  if (!el) return { error: 'no-tab', tab: ${JSON.stringify(tab)} };
+  el.click();
+  return { clicked: true, tab: ${JSON.stringify(tab)} };
+})()`;
+
+// The Specs tab: every spec file in the run. Not virtualised at the sizes seen,
+// but read defensively via textContent so a hidden panel still yields text.
+const SPECS = () => `(() => {
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('*')).filter(function (e) {
+    return !e.children.length && /\\.(cy|spec)\\.(js|ts|jsx|tsx)$/.test((e.textContent || '').trim());
+  });
+  var seen = [];
+  var out = [];
+  for (var i = 0; i < nodes.length; i++) {
+    var p = (nodes[i].textContent || '').trim();
+    if (seen.indexOf(p) !== -1) continue;
+    seen.push(p);
+    out.push({ index: out.length, spec: p });
+  }
+  return { total: out.length, specs: out, url: location.href };
+})()`;
 
 // Cheap readiness poll: is a replay open, for which test, and how long is it?
 const REPLAY_STATE = () => `(() => {
@@ -653,6 +873,187 @@ async function consoleProbe(opts) {
 const consoleExpr = (opts) =>
   exprWithHelpers(consoleProbe, [findConsolePanelSrc()], opts);
 
+// ───────────────────────────── network panel ─────────────────────────────
+/*
+ * The replay's Network tab. Rows carry the same `data-cy-event-id` /
+ * `data-cy-event-start` scheme as the console, so each request gets a timeline
+ * `fraction` you can hand to `cloud_seek`.
+ *
+ * Everything reads `textContent`, never `innerText`: the devtools panels are
+ * tab-switched, and `innerText` returns '' for anything not currently rendered —
+ * which silently produced a full list of blank rows during development.
+ */
+function networkSrc() {
+  return `
+  function activateNetworkTab() {
+    var tab = document.querySelector('[role=tab][aria-controls=network-tabpanel]')
+      || document.querySelector('[data-pendo*="network-tab"]')
+      || document.querySelector('button#network[role=tab]');
+    if (!tab) return { tabFound: false, activated: false };
+    if (tab.getAttribute('aria-selected') === 'true') return { tabFound: true, activated: false, alreadyActive: true };
+    tab.click();
+    return { tabFound: true, activated: true };
+  }
+  function netRows() {
+    return Array.prototype.slice.call(document.querySelectorAll('[data-cy^=devtool-network-item-]'))
+      .filter(function (e) { return /^devtool-network-item-\\d+$/.test(e.getAttribute('data-cy') || ''); });
+  }
+  function txt(el, sel) {
+    var e = el.querySelector(sel);
+    return e ? (e.textContent || '').replace(/\\s+/g, ' ').trim() : null;
+  }
+  function netInfo(row) {
+    return {
+      id: row.getAttribute('data-cy'),
+      eventId: row.getAttribute('data-cy-event-id'),
+      ts: Number(row.getAttribute('data-cy-event-start')),
+      status: txt(row, '[data-cy=network-response-status-code]'),
+      method: txt(row, '[data-cy=network-response-method]'),
+      path: txt(row, '[data-cy=network-response-path]'),
+    };
+  }
+  function netScroller() {
+    var list = document.querySelector('[data-cy=network-item-list]') || document.querySelector('#network-tabpanel');
+    if (!list) return null;
+    if (list.scrollHeight > list.clientHeight + 20) return list;
+    var inner = list.querySelector('.ReactVirtualized__List, .ReactVirtualized__Grid');
+    if (inner) return inner;
+    var all = Array.prototype.slice.call(list.querySelectorAll('*')).filter(function (e) {
+      return e.scrollHeight > e.clientHeight + 20 && e.clientHeight > 80;
+    });
+    return all.length ? all[0] : null;
+  }`;
+}
+
+async function networkListProbe(opts) {
+  /*__HELPERS__*/
+  var tab = activateNetworkTab();
+  if (tab.activated) await new Promise(function (r) { setTimeout(r, opts.tabWaitMs); });
+
+  // The All / Errors / Fetch-XHR sub-filter, applied in the UI so the scrape has
+  // less to walk.
+  if (opts.filterTab) {
+    var f = document.querySelector('[role=tab][aria-controls=' + opts.filterTab + '-tabpanel]');
+    if (f && f.getAttribute('aria-selected') !== 'true') {
+      f.click();
+      await new Promise(function (r) { setTimeout(r, 700); });
+    }
+  }
+
+  var bounds = null;
+  var range = document.querySelector('[data-cy=scrubber-container] input[type=range]');
+  if (range && Number(range.max) > Number(range.min)) bounds = { min: Number(range.min), max: Number(range.max) };
+
+  var scroller = netScroller();
+  var byKey = new Map();
+  function sample() {
+    var rows = netRows();
+    for (var i = 0; i < rows.length; i++) {
+      var info = netInfo(rows[i]);
+      var key = info.eventId != null ? 'e' + info.eventId : info.id;
+      if (key != null && !byKey.has(key)) byKey.set(key, info);
+    }
+  }
+  sample();
+  if (scroller) {
+    scroller.scrollTop = 0;
+    await new Promise(function (r) { setTimeout(r, 200); });
+    var last = -1;
+    for (var s = 0; s < opts.maxScrollSteps; s++) {
+      sample();
+      var atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+      if (atEnd || (scroller.scrollTop === last && s > 2)) { sample(); break; }
+      last = scroller.scrollTop;
+      scroller.scrollTop = Math.min(scroller.scrollTop + Math.floor(scroller.clientHeight * 0.7), scroller.scrollHeight);
+      await new Promise(function (r) { setTimeout(r, opts.stepDelayMs); });
+    }
+  }
+
+  var items = Array.from(byKey.values()).sort(function (a, b) {
+    var an = Number((a.id || '').replace(/\\D/g, '')), bn = Number((b.id || '').replace(/\\D/g, ''));
+    return an - bn;
+  }).map(function (v, i) {
+    var o = {
+      index: i, rowId: v.id, status: v.status, method: v.method, path: v.path,
+    };
+    if (bounds && isFinite(v.ts)) {
+      o.tSec = Number(((v.ts - bounds.min) / 1000).toFixed(2));
+      o.fraction = Number(((v.ts - bounds.min) / (bounds.max - bounds.min)).toFixed(4));
+    }
+    return o;
+  });
+
+  if (!items.length) {
+    return {
+      error: 'no-network-rows',
+      networkTab: tab,
+      hasPanel: !!document.querySelector('[data-cy=network-panel], #network-tabpanel'),
+      emptyMessage: (function () {
+        var p = document.querySelector('#network-tabpanel');
+        return p ? (p.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 160) : null;
+      })(),
+    };
+  }
+  return { networkTab: tab, filterTab: opts.filterTab || 'all', total: items.length, scrolled: !!scroller, items: items };
+}
+
+const networkListExpr = (opts) => exprWithHelpers(networkListProbe, [networkSrc()], opts);
+
+/*
+ * Expand one request and read its payload.
+ *
+ * The detail is itself two tab panels (Request / Response), so both are visited.
+ * Cypress Cloud refuses to render very large bodies ("Sorry, we can't show
+ * response bodies that are this big") — that message is passed through verbatim
+ * rather than being reported as an empty body, since the two mean different
+ * things to whoever is debugging.
+ */
+async function networkDetailProbe(opts) {
+  /*__HELPERS__*/
+  var tab = activateNetworkTab();
+  if (tab.activated) await new Promise(function (r) { setTimeout(r, opts.tabWaitMs); });
+
+  var rows = netRows();
+  var row = null;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].getAttribute('data-cy') === opts.rowId) { row = rows[i]; break; }
+  }
+  if (!row) {
+    return {
+      error: 'row-not-rendered',
+      rowId: opts.rowId,
+      rendered: rows.map(function (r) { return r.getAttribute('data-cy'); }),
+      hint: 'The network list is virtualised — that row is not currently in the DOM. Re-run `cloud_network_logs` and use a row from the freshly returned list.',
+    };
+  }
+  var info = netInfo(row);
+
+  var caret = document.querySelector('[data-cy="' + opts.rowId + '-caret"]') || row.querySelector('[data-cy$="-caret"]');
+  (caret || row).click();
+  await new Promise(function (r) { setTimeout(r, opts.expandWaitMs); });
+
+  function panelText(id) {
+    var p = document.querySelector('#' + id);
+    return p ? (p.textContent || '').replace(/\\s+/g, ' ').trim() : null;
+  }
+  var request = panelText('request-tabpanel');
+  var respTab = document.querySelector('[role=tab][aria-controls=response-tabpanel]');
+  if (respTab && respTab.getAttribute('aria-selected') !== 'true') {
+    respTab.click();
+    await new Promise(function (r) { setTimeout(r, opts.expandWaitMs); });
+  }
+  var response = panelText('response-tabpanel');
+
+  return {
+    request: info,
+    requestDetail: request,
+    responseDetail: response,
+    bodyTooLarge: /can't show (response|request) bodies that are this big/i.test(String(response) + String(request)),
+  };
+}
+
+const networkDetailExpr = (opts) => exprWithHelpers(networkDetailProbe, [networkSrc()], opts);
+
 module.exports = {
   expr,
   PAGE_INFO,
@@ -661,10 +1062,20 @@ module.exports = {
   scrollAppExpr,
   consoleExpr,
   COMMANDS,
+  FAILURE,
   pinCommandExpr,
   TESTS,
   selectTestExpr,
   REPLAY_STATE,
+  runTestsExpr,
+  statusFilterExpr,
+  runTabExpr,
+  SPECS,
+  networkListExpr,
+  networkDetailExpr,
   // exported for unit tests
-  _internals: { withHelpers, findScrubberSrc, findAppFrameSrc, findConsolePanelSrc, commandsSrc, testsSrc },
+  _internals: {
+    withHelpers, findScrubberSrc, findAppFrameSrc, findConsolePanelSrc,
+    commandsSrc, testsSrc, runListSrc, networkSrc,
+  },
 };
