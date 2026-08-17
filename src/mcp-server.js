@@ -14,6 +14,8 @@ const cloudCommands = require('./cloud-commands');
 const cloudRun = require('./cloud-run');
 const cloudNetwork = require('./cloud-network');
 const ciLinks = require('./ci-links');
+const cloudLauncher = require('./cloud-launcher');
+const { findSignals } = require('./cloud-signals');
 
 async function runMcp() {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -67,22 +69,32 @@ async function runMcp() {
   // are expected to be running at the same time, which is exactly why nothing
   // here touches `cdp` or `attachedPort`.
   let cloudCdp = null;
+  // Launches the browser if there isn't one. Previously every cloud session
+  // began by telling the caller to go run a terminal command — friction the
+  // agent could not resolve itself, and which discarded any work a tool had
+  // already done (reading a CI job log) before it got here.
+  let autoLaunchNote = null;
   async function ensureCloud() {
-    const session = await readCloudSession();
-    if (!session?.port) {
-      throw new Error('No cloud debug browser. Run `cypress-inspect cloud` (optionally with a replay URL) first.');
-    }
-    if (!(await isCdpAlive(session.port))) {
-      throw new Error(
-        `The cloud debug browser recorded on port ${session.port} is not responding — it was probably closed. ` +
-        'Run `cypress-inspect cloud` again.',
-      );
+    let session = await readCloudSession();
+    const live = session?.port ? await isCdpAlive(session.port) : null;
+    if (!live) {
+      const started = await cloudLauncher.ensureBrowser();
+      if (!started.ok) {
+        throw new Error(
+          `${started.hint} (${started.error})` +
+          (started.error === 'browser-did-not-start' ? '' : ' You can also start it yourself: `cypress-inspect cloud`.'),
+        );
+      }
+      autoLaunchNote = started.launched
+        ? 'A cloud debug browser was started automatically. If Cypress Cloud shows a sign-in page, complete it once in that window — the profile is persistent.'
+        : null;
+      session = await readCloudSession();
     }
     if (!cloudCdp || cloudCdp.port !== session.port) {
       if (cloudCdp) await cloudCdp.close().catch(() => {});
       cloudCdp = new CloudCdp(session.port);
     }
-    return { cloud: cloudCdp, session };
+    return { cloud: cloudCdp, session, autoLaunched: autoLaunchNote };
   }
 
   // Every cloud probe can come back with a structured `{ error }` when a
@@ -260,7 +272,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.16.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.17.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without
@@ -1414,11 +1426,14 @@ async function runMcp() {
       inputSchema: { url: z.string() },
     },
     async ({ url }) => {
+      // Browser first: it is the cheap step, and failing AFTER a 4-second job-log
+      // fetch used to throw away the run URL it had just found.
+      const { cloud, autoLaunched } = await ensureCloud();
       const found = await ciLinks.findRunUrlForCiJob(url);
       if (found.error) return textResult(JSON.stringify(found, null, 2));
-      const { cloud } = await ensureCloud();
       const opened = await cloudRun.openRun(cloud, found.url);
       return textResult(JSON.stringify({
+        ...(autoLaunched ? { autoLaunched } : {}),
         job: found.job,
         foundRunUrl: found.url,
         ...(found.allUrls.length > 1 ? { otherUrlsInLog: found.allUrls.slice(1) } : {}),
@@ -1515,12 +1530,13 @@ async function runMcp() {
     'cloud_network_logs',
     {
       title: 'Read the replay\'s network activity',
-      description: 'Recorded requests for the test being replayed: time, method, status and path, one line each. Filters: `failedOnly` (4xx/5xx — uses the panel\'s own Errors tab), `fetchXhrOnly` (skip images/assets), `grep` (regex over method + path + status), `offset`/`limit`. Each row carries `[<sec> f=<fraction>]`, so you can `cloud_seek { fraction }` to the moment a request fired. Rows are listed compactly on purpose — pass a row\'s `rowId` to `cloud_network_detail` for headers and payloads.',
+      description: 'Recorded requests for the test being replayed: time, method, status and path, one line each. Filters: `failedOnly` (4xx/5xx — uses the panel\'s own Errors tab, and hides telemetry endpoints like Sentry that fail by design in a test harness; the count hidden is always reported, and `includeNoise: true` brings them back), `fetchXhrOnly` (skip images/assets), `grep` (regex over method + path + status), `offset`/`limit`. Each row carries `[<sec> f=<fraction>]`, so you can `cloud_seek { fraction }` to the moment a request fired. Rows are listed compactly on purpose — pass a row\'s `rowId` to `cloud_network_detail` for headers and payloads.',
       annotations: READ,
       inputSchema: {
         grep: z.string().optional(),
         failedOnly: z.boolean().optional(),
         fetchXhrOnly: z.boolean().optional(),
+        includeNoise: z.boolean().optional(),
         offset: z.number().int().min(0).optional(),
         limit: z.number().int().positive().max(500).optional(),
       },
@@ -1534,7 +1550,10 @@ async function runMcp() {
           'bad-grep': 'The `grep` value is not a valid JavaScript regular expression.',
         });
       }
-      const header = `# network: ${result.total} recorded, ${result.matched} matched, showing ${result.returned} (filter tab: ${result.filterTab})`;
+      const header = `# network: ${result.total} recorded, ${result.matched} matched, showing ${result.returned} (filter tab: ${result.filterTab})` +
+        (result.suppressedNoise
+          ? `\n# ${result.suppressedNoise} failing telemetry request(s) hidden as known noise [${result.suppressedKinds.join(', ')}] — pass \`includeNoise: true\` to see them`
+          : '');
       const lines = result.items.map((i) =>
         `${i.tSec != null ? `[${String(i.tSec).padStart(6)}s f=${i.fraction}] ` : ''}` +
         `${(i.status || '---').padStart(3)} ${(i.method || '').padEnd(6)} ${(i.path || '').slice(0, 120)}   (${i.rowId})`);
@@ -1595,11 +1614,13 @@ async function runMcp() {
     'cloud_get_failure',
     {
       title: 'Why did this test fail?',
-      description: 'The failure of the test being replayed: error message, stack trace, and the command it failed on. Start here after `cloud_open_test { status: "failed" }`. Note `autoLoggedNetworkFailures` — Cypress stamps "failed" on auto-logged network rows too, so the first red row in the log is often an unrelated request; this picks the last failed row that is NOT a network row, and lists the network ones separately rather than hiding them.',
+      description: 'The failure of the test being replayed: error message, stack trace, the command it failed on, AND `consoleSignals` — high-signal lines scraped from the replay console (uncaught exceptions, ResizeObserver loop errors, unhandled rejections, retry exhaustion, random-item dropdown fallbacks), each with what it means. Those often reframe the failure: a reported 30s `cy.get` timeout turned out to be Cypress aborting on a ResizeObserver warning. Start here after `cloud_open_test { status: "failed" }`. Note `autoLoggedNetworkFailures` — Cypress stamps "failed" on auto-logged network rows too, so the first red row in the log is often an unrelated request; this picks the last failed row that is NOT a network row, and lists the network ones separately. Pass `skipConsole: true` to skip the console scrape if you only want the error.',
       annotations: READ,
-      inputSchema: {},
+      inputSchema: {
+        skipConsole: z.boolean().optional(),
+      },
     },
-    async () => {
+    async ({ skipConsole } = {}) => {
       const { cloud } = await ensureCloud();
       const result = await cloud.evaluate(cloudProbe.FAILURE());
       if (result?.error) {
@@ -1607,7 +1628,24 @@ async function runMcp() {
           'no-failure-found': 'No error message or failed command in this replay — the test may have passed. Check `cloud_list_tests { status: "failed" }`.',
         });
       }
-      return textResult(JSON.stringify(result, null, 2));
+      // The console holds the explanation surprisingly often, and nobody reads
+      // 200-800 rows by hand looking for it.
+      let consoleSignals = null;
+      let consoleRows = null;
+      if (!skipConsole) {
+        const logs = await cloud.evaluate(cloudProbe.consoleExpr({
+          grep: null, limit: null, maxScrollSteps: 2000, stepDelayMs: 90, tabWaitMs: 1200,
+        })).catch(() => null);
+        if (logs && !logs.error) {
+          consoleRows = logs.totalRows;
+          consoleSignals = findSignals(logs.entries);
+        }
+      }
+      return textResult(JSON.stringify({
+        ...result,
+        ...(consoleRows != null ? { consoleRows } : {}),
+        ...(consoleSignals ? { consoleSignals } : {}),
+      }, null, 2));
     },
   );
 

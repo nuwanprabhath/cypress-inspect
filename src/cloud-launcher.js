@@ -213,4 +213,55 @@ async function waitForCdp(port, child, timeoutMs = 20000, pollMs = 250) {
   return null;
 }
 
-module.exports = { runCloud, findChrome, buildChromeArgs, parseCloudArgs };
+/*
+ * Make sure a cloud debug browser exists, launching one if it does not.
+ *
+ * This is what the MCP tools call. Without it, every session began with a hard
+ * stop — "run `cypress-inspect cloud` in a terminal first" — which is friction
+ * for a tool that owns that launcher anyway, and which the agent cannot resolve
+ * on its own. Worse, a tool that had already done expensive work (reading a CI
+ * job log) would throw it away on that error.
+ *
+ * The browser is spawned DETACHED and unref'd so it outlives the MCP server:
+ * the server is restarted whenever the editor reloads, and taking the user's
+ * logged-in browser down with it would be surprising. Nothing cleans up the
+ * session file on exit, which is fine — every reader checks the port for
+ * liveness rather than trusting the file.
+ */
+async function ensureBrowser({ port = DEFAULT_PORT, profileDir = PROFILE_DIR, autoLaunch = true } = {}) {
+  const alive = await isCdpAlive(port);
+  if (alive) {
+    const existing = await readCloudSession();
+    if (!existing) await writeCloudSession({ port, profileDir, startedAt: Date.now(), adopted: true });
+    return { ok: true, launched: false, browser: alive.Browser };
+  }
+  if (!autoLaunch) {
+    return { ok: false, error: 'no-browser', hint: 'Run `cypress-inspect cloud` to start the debug browser.' };
+  }
+
+  let chrome;
+  try {
+    chrome = findChrome();
+  } catch (err) {
+    return { ok: false, error: 'chrome-not-found', hint: String(err.message || err) };
+  }
+  fs.mkdirSync(profileDir, { recursive: true });
+  const child = spawn(chrome, buildChromeArgs({ port, profileDir, url: 'https://cloud.cypress.io/' }), {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const ready = await waitForCdp(port, child);
+  if (!ready) {
+    return {
+      ok: false,
+      error: 'browser-did-not-start',
+      hint: `Chrome did not open a debugging port on ${port} within 20s. Another process may be holding that port, or Chrome may have failed to launch — try \`cypress-inspect cloud\` in a terminal to see its output.`,
+    };
+  }
+  await writeCloudSession({ port, profileDir, pid: child.pid, startedAt: Date.now(), autoLaunched: true });
+  return { ok: true, launched: true, browser: ready.Browser };
+}
+
+module.exports = { runCloud, ensureBrowser, findChrome, buildChromeArgs, parseCloudArgs };

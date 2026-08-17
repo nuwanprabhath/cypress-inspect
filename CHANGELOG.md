@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.17.0
+
+### Added
+- **The browser starts itself.** Every cloud session used to begin with a hard stop —
+  "run `cypress-inspect cloud` in a terminal first" — which an agent cannot resolve on
+  its own, and which is odd for a tool that owns that launcher. `ensureCloud` now
+  launches one when there isn't a live browser, spawned **detached** so it survives the
+  MCP server being restarted by an editor reload. Measured cold (no browser, no session
+  file): GitLab job URL → loaded run in **6.2 s, one call**. `cypress-inspect cloud`
+  still works for launching it yourself.
+- **`cloud_get_failure` now surfaces `consoleSignals`.** A 200–800 row console holds a
+  handful of lines that actually explain a CI-only failure, and nobody finds them by
+  eye. Real case, from the run this was built against: three tests failed reporting
+  plain `cy.get` timeouts, while the console held
+
+  > `Uncaught exception caught by Cypress: … ResizeObserver loop completed with
+  > undelivered notifications … Cypress will automatically fail the current test.`
+
+  which reframes the failure from "the element never rendered" to "Cypress aborted on a
+  benign browser warning". Signals carry a severity, **what the pattern means**, a count,
+  and a seekable `fraction`. Repeats are counted with a few samples rather than dumped,
+  so a warning that fires 200 times cannot bury the rest. Mirrors the local runner's
+  `flakeSignals`. `skipConsole: true` opts out.
+- **`cloud_network_logs { failedOnly }` sets aside telemetry that fails by design.**
+  Every run examined returned nothing but Sentry POSTs 400ing on a placeholder DSN
+  (`sentry_key=examplePublicKey`) — 6 of 6 in one job, 4 of 4 in another. A filter whose
+  entire output is noise trains you to ignore it. These are **flagged, never silently
+  dropped**: the hidden count and kinds are always printed, and `includeNoise: true`
+  brings them back. Suppression is deliberately narrow — real app traffic is covered by
+  a test asserting it is never mistaken for noise, since hiding a genuine 500 would be
+  far worse than showing a Sentry 400.
+
+### Fixed
+- **`cloud_open_ci_job` discarded work when the browser was missing.** It fetched the CI
+  job log first (~4 s), found the run URL, then threw a bare "no cloud debug browser"
+  and lost it. The browser check now happens first — it is the cheap step.
+
 ## 0.16.0
 
 ### Fixed
