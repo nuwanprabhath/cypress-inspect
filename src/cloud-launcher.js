@@ -52,12 +52,20 @@ function findChrome(env = process.env, platform = process.platform) {
   );
 }
 
-// Note the flags NOT here: no --remote-allow-origins. That flag disables the
-// Origin check on the debugging WebSocket, which is what stops arbitrary web
-// pages from driving this browser — and this browser holds a logged-in Cypress
-// Cloud session. chrome-remote-interface sends no Origin header, so it connects
-// without the flag.
-function buildChromeArgs({ port, profileDir, url }) {
+// Headless Chrome defaults to an 800x600 viewport. Every list this tool scrapes
+// (run results, command log, console, network) is virtualised, and the replay
+// lays itself out against the viewport, so a small window means more scroll
+// steps and a cramped replay. Headless therefore always carries a real size.
+const DEFAULT_WINDOW_SIZE = '1600,1200';
+
+// Note the flags NOT here: no --remote-allow-origins, and no --no-sandbox.
+// --remote-allow-origins disables the Origin check on the debugging WebSocket,
+// which is what stops arbitrary web pages from driving this browser — and this
+// browser holds a logged-in Cypress Cloud session. chrome-remote-interface sends
+// no Origin header, so it connects without the flag. --no-sandbox is what a
+// root-in-Docker CI container usually needs, but adding it here would weaken
+// every headless run including local ones; that has to stay an explicit choice.
+function buildChromeArgs({ port, profileDir, url, headless = false, windowSize = null }) {
   const args = [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profileDir}`,
@@ -65,18 +73,57 @@ function buildChromeArgs({ port, profileDir, url }) {
     '--no-default-browser-check',
     '--disable-features=Translate',
   ];
+  if (headless) {
+    // `=new` is the headless that shares the normal browser implementation, so
+    // Input.dispatchMouseEvent still produces TRUSTED events — which the
+    // timeline scrubber depends on, being a React controlled input.
+    args.push('--headless=new');
+    args.push(`--window-size=${windowSize || DEFAULT_WINDOW_SIZE}`);
+  }
   if (url) args.push(url);
   return args;
 }
 
+// Accept `1280,900` and `1280x900`; reject anything else rather than passing a
+// malformed value to Chrome, which ignores it and silently falls back to 800x600.
+function parseWindowSize(raw) {
+  const m = String(raw || '').trim().match(/^(\d{2,5})\s*[x,]\s*(\d{2,5})$/i);
+  if (!m) throw new Error(`Invalid --window-size: ${raw} (expected WIDTH,HEIGHT — e.g. 1600,1200)`);
+  return `${m[1]},${m[2]}`;
+}
+
+/*
+ * How the MCP server decides whether to auto-launch a headless browser.
+ *
+ * The agent has no terminal to pass flags on, so this is the only way a CI job
+ * (or anyone who does not want a window appearing) can get a headless one.
+ * A malformed window size is ignored rather than thrown: this runs inside a
+ * long-lived stdio server, where a bad env var should not be fatal.
+ *
+ * Note this only applies when a browser is actually launched — if one is
+ * already listening, it is reused as-is, headed or not.
+ */
+function cloudLaunchOptionsFromEnv(env = process.env) {
+  const raw = String(env.CYPRESS_INSPECT_CLOUD_HEADLESS || '').trim().toLowerCase();
+  const headless = raw === '1' || raw === 'true' || raw === 'yes';
+  let windowSize = null;
+  if (env.CYPRESS_INSPECT_CLOUD_WINDOW_SIZE) {
+    try { windowSize = parseWindowSize(env.CYPRESS_INSPECT_CLOUD_WINDOW_SIZE); } catch { windowSize = null; }
+  }
+  return { headless, windowSize };
+}
+
 function parseCloudArgs(argv = []) {
-  const opts = { port: DEFAULT_PORT, profileDir: PROFILE_DIR, url: null };
+  const opts = { port: DEFAULT_PORT, profileDir: PROFILE_DIR, url: null, headless: false, windowSize: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--port') opts.port = Number(argv[++i]);
     else if (a.startsWith('--port=')) opts.port = Number(a.slice('--port='.length));
     else if (a === '--profile') opts.profileDir = path.resolve(argv[++i]);
     else if (a.startsWith('--profile=')) opts.profileDir = path.resolve(a.slice('--profile='.length));
+    else if (a === '--headless') opts.headless = true;
+    else if (a === '--window-size') opts.windowSize = parseWindowSize(argv[++i]);
+    else if (a.startsWith('--window-size=')) opts.windowSize = parseWindowSize(a.slice('--window-size='.length));
     else if (!a.startsWith('-')) opts.url = a;
   }
   if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
@@ -96,12 +143,13 @@ function looksShellSplit(url) {
   return /cloud\.cypress\.io/.test(url) && url.includes('?') && !url.includes('&');
 }
 
-function banner(port, url) {
+function banner(port, url, headless = false) {
   const lines = [
     '',
     '[cypress-inspect] Cloud debug browser ready.',
     `[cypress-inspect]   CDP port : ${port}`,
     `[cypress-inspect]   Profile  : persistent — your cloud.cypress.io login is remembered`,
+    `[cypress-inspect]   Display  : ${headless ? 'headless (no window — drive it with the cloud_* tools)' : 'headed'}`,
     '',
     '[cypress-inspect] Next:',
   ];
@@ -120,7 +168,7 @@ function banner(port, url) {
 }
 
 async function runCloud(argv = []) {
-  const { port, profileDir, url, looksShellSplit: split } = parseCloudArgs(argv);
+  const { port, profileDir, url, headless, windowSize, looksShellSplit: split } = parseCloudArgs(argv);
 
   if (split) {
     console.error('[cypress-inspect] ⚠ That URL has only one query parameter, which usually means the shell');
@@ -162,7 +210,7 @@ async function runCloud(argv = []) {
 
   const chrome = findChrome();
   fs.mkdirSync(profileDir, { recursive: true });
-  const args = buildChromeArgs({ port, profileDir, url });
+  const args = buildChromeArgs({ port, profileDir, url, headless, windowSize });
 
   console.error(`[cypress-inspect] Launching cloud debug browser: ${chrome}`);
   const child = spawn(chrome, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -185,7 +233,7 @@ async function runCloud(argv = []) {
   }
 
   await writeCloudSession({ port, profileDir, pid: child.pid, startedAt: Date.now(), url: url || null });
-  console.error(banner(port, url));
+  console.error(banner(port, url, headless));
 
   process.on('SIGINT', () => child.kill('SIGINT'));
   process.on('SIGTERM', () => child.kill('SIGTERM'));
@@ -228,7 +276,7 @@ async function waitForCdp(port, child, timeoutMs = 20000, pollMs = 250) {
  * session file on exit, which is fine — every reader checks the port for
  * liveness rather than trusting the file.
  */
-async function ensureBrowser({ port = DEFAULT_PORT, profileDir = PROFILE_DIR, autoLaunch = true } = {}) {
+async function ensureBrowser({ port = DEFAULT_PORT, profileDir = PROFILE_DIR, autoLaunch = true, headless = false, windowSize = null } = {}) {
   const alive = await isCdpAlive(port);
   if (alive) {
     const existing = await readCloudSession();
@@ -246,7 +294,7 @@ async function ensureBrowser({ port = DEFAULT_PORT, profileDir = PROFILE_DIR, au
     return { ok: false, error: 'chrome-not-found', hint: String(err.message || err) };
   }
   fs.mkdirSync(profileDir, { recursive: true });
-  const child = spawn(chrome, buildChromeArgs({ port, profileDir, url: 'https://cloud.cypress.io/' }), {
+  const child = spawn(chrome, buildChromeArgs({ port, profileDir, url: 'https://cloud.cypress.io/', headless, windowSize }), {
     detached: true,
     stdio: 'ignore',
   });
@@ -264,4 +312,4 @@ async function ensureBrowser({ port = DEFAULT_PORT, profileDir = PROFILE_DIR, au
   return { ok: true, launched: true, browser: ready.Browser };
 }
 
-module.exports = { runCloud, ensureBrowser, findChrome, buildChromeArgs, parseCloudArgs };
+module.exports = { runCloud, ensureBrowser, findChrome, buildChromeArgs, parseCloudArgs, cloudLaunchOptionsFromEnv, DEFAULT_WINDOW_SIZE };

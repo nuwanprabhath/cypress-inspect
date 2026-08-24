@@ -78,15 +78,21 @@ async function runMcp() {
     let session = await readCloudSession();
     const live = session?.port ? await isCdpAlive(session.port) : null;
     if (!live) {
-      const started = await cloudLauncher.ensureBrowser();
+      const launchOpts = cloudLauncher.cloudLaunchOptionsFromEnv();
+      const started = await cloudLauncher.ensureBrowser(launchOpts);
       if (!started.ok) {
         throw new Error(
           `${started.hint} (${started.error})` +
           (started.error === 'browser-did-not-start' ? '' : ' You can also start it yourself: `cypress-inspect cloud`.'),
         );
       }
+      // Headless has no window to sign in to, so the usual advice would send
+      // whoever reads it looking for one that does not exist. Signing in has to
+      // happen once in a headed browser; the profile is shared, so it carries over.
       autoLaunchNote = started.launched
-        ? 'A cloud debug browser was started automatically. If Cypress Cloud shows a sign-in page, complete it once in that window — the profile is persistent.'
+        ? (launchOpts.headless
+          ? 'A HEADLESS cloud debug browser was started automatically (CYPRESS_INSPECT_CLOUD_HEADLESS). If Cypress Cloud reports a sign-in page, it cannot be completed here — run `cypress-inspect cloud` once in a terminal, sign in there, then retry; the profile is shared and persistent.'
+          : 'A cloud debug browser was started automatically. If Cypress Cloud shows a sign-in page, complete it once in that window — the profile is persistent.')
         : null;
       session = await readCloudSession();
     }
@@ -272,7 +278,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.20.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.21.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without

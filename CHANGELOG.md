@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.21.0
+
+### Added
+- **Headless cloud mode.** `cypress-inspect cloud --headless` runs the debug browser with
+  no window, so an agent can drive Cypress Cloud without a browser taking over the
+  screen. For the MCP server — which has no command line to pass flags on — set
+  `CYPRESS_INSPECT_CLOUD_HEADLESS=1` (and optionally
+  `CYPRESS_INSPECT_CLOUD_WINDOW_SIZE=1600,1200`) and any auto-launched browser is
+  headless. `--window-size` accepts `1600,1200` or `1600x1200`.
+
+  Headless uses `--headless=new`, which shares the normal browser implementation, so
+  `Input.dispatchMouseEvent` still produces **trusted** events — `cloud_seek` drives the
+  timeline scrubber (a React controlled input) exactly as it does headed. Verified
+  end-to-end against a real run: run/spec/test navigation, failure extraction, console
+  and network scrapes, seek and screenshots all behave identically.
+
+  A window size is always passed when headless, because headless Chrome otherwise
+  defaults to 800x600 — and every list this tool reads is virtualised, so a small
+  viewport means many more scroll steps and a cramped replay.
+
+  **`--headless` cannot sign you in.** The browser is only usable because the profile at
+  `~/.cypress-inspect/cloud-profile` is persistent; a fresh profile hitting Cypress Cloud
+  is redirected to `/login`, and there is no window in which to complete it. Sign in once
+  with a headed `cypress-inspect cloud`, then headless works from the shared profile.
+  This is the real constraint on running cloud mode inside a CI job.
+
+  Deliberately NOT added: `--no-sandbox`. A root-in-Docker CI container usually needs it,
+  but adding it here would weaken every headless run including local ones, on a browser
+  holding a logged-in Cypress Cloud session. It stays an explicit choice.
+
+### Fixed
+- **`cloud_network_detail` failed on any row that had scrolled out of view.** The network
+  panel is virtualised, and `cloud_network_logs` scrolls it while walking the full list —
+  so by the time the caller asked about an interesting row, that row was usually no longer
+  mounted and the answer was `row-not-rendered` with a suggestion to re-list, which does
+  not help because re-listing scrolls it away again. Observed on a real run: 61 rows
+  listed, only rows 33-60 mounted, and every request for a row below 33 failed.
+
+  The probe now scrolls the row back into view before reading it. Row ids are positional
+  (`devtool-network-item-N`), so it estimates row height from the rendered window, jumps
+  to the target, then corrects a window at a time. Stepping stops as soon as the scroll
+  position stops moving, so a row that genuinely does not exist still returns
+  `row-not-rendered` rather than spinning.
+
 ## 0.20.0
 
 ### Fixed

@@ -87,3 +87,78 @@ test('findChrome explains how to recover when no browser is installed', () => {
   // 'aix' hits neither the macOS absolute-path list nor the linux `which` probe.
   assert.throws(() => findChrome({}, 'aix'), /CHROME_PATH/);
 });
+
+// ── headless mode ───────────────────────────────────────────────────────────
+
+test('parseCloudArgs defaults to a headed browser', () => {
+  assert.equal(parseCloudArgs([]).headless, false);
+});
+
+test('parseCloudArgs accepts --headless', () => {
+  assert.equal(parseCloudArgs(['--headless']).headless, true);
+  const url = 'https://cloud.cypress.io/projects/x/runs/1/test-results?a=1&b=2';
+  const o = parseCloudArgs(['--headless', '--port=9444', url]);
+  assert.equal(o.headless, true);
+  assert.equal(o.port, 9444);
+  assert.equal(o.url, url, '--headless must not be mistaken for the positional URL');
+});
+
+test('parseCloudArgs takes a --window-size and rejects a malformed one', () => {
+  assert.equal(parseCloudArgs(['--window-size=1280,900']).windowSize, '1280,900');
+  assert.equal(parseCloudArgs(['--window-size', '1280x900']).windowSize, '1280,900', 'WxH is accepted and normalised');
+  assert.throws(() => parseCloudArgs(['--window-size', 'huge']), /Invalid --window-size/);
+});
+
+test('buildChromeArgs stays headed unless asked', () => {
+  const args = buildChromeArgs({ port: 9333, profileDir: '/tmp/prof', url: null });
+  assert.ok(!args.some((a) => a.startsWith('--headless')));
+});
+
+test('buildChromeArgs runs headless with an explicit window size', () => {
+  // Headless Chrome defaults to 800x600. Cypress Cloud's run list, command log
+  // and network panel are all virtualised, and the replay lays out against the
+  // viewport — at 800x600 the scrapes do far more work and the replay is cramped.
+  // So a headless browser must always be given a real window size.
+  const args = buildChromeArgs({ port: 9333, profileDir: '/tmp/prof', url: null, headless: true });
+  assert.ok(args.includes('--headless=new'), 'must use new headless, which supports Input/Page domains');
+  assert.ok(args.some((a) => a.startsWith('--window-size=')));
+  assert.ok(!args.includes('--window-size=800,600'));
+});
+
+test('buildChromeArgs honours a caller-supplied window size', () => {
+  const args = buildChromeArgs({ port: 9333, profileDir: '/tmp/prof', url: null, headless: true, windowSize: '1280,900' });
+  assert.ok(args.includes('--window-size=1280,900'));
+});
+
+test('headless does not disable the Chrome sandbox', () => {
+  // CI containers running as root often need --no-sandbox, but adding it here
+  // would silently weaken every headless run, including local ones, on a browser
+  // holding a logged-in cloud.cypress.io session. Callers who need it must opt in.
+  const args = buildChromeArgs({ port: 9333, profileDir: '/tmp/prof', url: null, headless: true });
+  assert.ok(!args.includes('--no-sandbox'));
+});
+
+test('cloudLaunchOptionsFromEnv is headed unless the environment asks otherwise', () => {
+  const { cloudLaunchOptionsFromEnv } = require('../src/cloud-launcher');
+  assert.deepEqual(cloudLaunchOptionsFromEnv({}), { headless: false, windowSize: null });
+  assert.equal(cloudLaunchOptionsFromEnv({ CYPRESS_INSPECT_CLOUD_HEADLESS: '0' }).headless, false);
+  assert.equal(cloudLaunchOptionsFromEnv({ CYPRESS_INSPECT_CLOUD_HEADLESS: 'false' }).headless, false);
+  assert.equal(cloudLaunchOptionsFromEnv({ CYPRESS_INSPECT_CLOUD_HEADLESS: '' }).headless, false);
+});
+
+test('cloudLaunchOptionsFromEnv turns headless on for a CI agent', () => {
+  const { cloudLaunchOptionsFromEnv } = require('../src/cloud-launcher');
+  assert.equal(cloudLaunchOptionsFromEnv({ CYPRESS_INSPECT_CLOUD_HEADLESS: '1' }).headless, true);
+  assert.equal(cloudLaunchOptionsFromEnv({ CYPRESS_INSPECT_CLOUD_HEADLESS: 'true' }).headless, true);
+  assert.equal(
+    cloudLaunchOptionsFromEnv({ CYPRESS_INSPECT_CLOUD_HEADLESS: '1', CYPRESS_INSPECT_CLOUD_WINDOW_SIZE: '1280x900' }).windowSize,
+    '1280,900',
+  );
+});
+
+test('cloudLaunchOptionsFromEnv ignores a malformed window size rather than crashing the MCP server', () => {
+  // This is read at tool-call time inside a long-lived stdio server; a bad env
+  // var must not take the whole server down, so it falls back to the default.
+  const { cloudLaunchOptionsFromEnv } = require('../src/cloud-launcher');
+  assert.equal(cloudLaunchOptionsFromEnv({ CYPRESS_INSPECT_CLOUD_WINDOW_SIZE: 'huge' }).windowSize, null);
+});

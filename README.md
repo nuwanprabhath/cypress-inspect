@@ -230,6 +230,8 @@ Cloud mode automates the digging half:
 cypress-inspect cloud
 # or straight to a replay:
 cypress-inspect cloud "https://cloud.cypress.io/projects/…/test-results/…/replay?…"
+# no window, for agents and unattended use:
+cypress-inspect cloud --headless
 ```
 
 This launches a **separate** Chrome with CDP enabled on a **persistent profile**
@@ -239,6 +241,32 @@ argument / call `cloud_open`), then let the agent work:
 
 > "This spec only fails in CI. Here's the Test Replay link — use the cypress-inspect
 > cloud tools to find why."
+
+#### Headless
+
+`--headless` runs the same browser with no window. Everything works exactly as it does
+headed — including `cloud_seek`, because `--headless=new` still delivers **trusted**
+input events to the timeline scrubber. A window size is always set (default
+`1600,1200`; override with `--window-size=1280,900`), since headless Chrome otherwise
+defaults to 800x600 and every list here is virtualised.
+
+For the MCP server there is no command line, so set the environment instead:
+
+```bash
+CYPRESS_INSPECT_CLOUD_HEADLESS=1     # any auto-launched cloud browser is headless
+CYPRESS_INSPECT_CLOUD_WINDOW_SIZE=1600,1200
+```
+
+**Headless cannot sign you in.** A fresh profile is redirected to `/login` and there is
+no window to complete it in. Sign in once with a headed `cypress-inspect cloud`; the
+persistent profile carries the session into headless runs. This is also the thing that
+stops cloud mode from running unattended inside a CI job — the runner has no signed-in
+profile, and Cypress Cloud login is SSO/OAuth. Running it against CI job URLs from a
+machine that *does* have the profile is the supported path.
+
+`--no-sandbox` is deliberately not added, even headless. A root-in-Docker container
+usually needs it, but it would weaken every run on a browser holding a live Cypress
+Cloud session, so it stays an explicit choice.
 
 It is **fully isolated from `open` / `run`**: its own browser, its own session file
 (`~/.cypress-inspect/cloud-session.json`), and a fixed port **9333**. Both modes can

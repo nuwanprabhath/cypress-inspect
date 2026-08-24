@@ -277,3 +277,130 @@ test('hitting the step limit is reported, never passed off as a complete read', 
   assert.equal(out.hitStepLimit, true, 'a truncated scrape must say so');
   assert.ok(out.entries.length < rows.length);
 });
+
+// ── network detail on a virtualised list ────────────────────────────────────
+// The network panel is virtualised exactly like the console: `cloud_network_logs`
+// walks the whole list and returns every row, but by the time a follow-up
+// `cloud_network_detail` runs, the list has scrolled back and the row the caller
+// asked about is no longer mounted. Modelled here so the probe has to find it.
+
+function makeNetworkDom({ total = 61, rowHeight = 24, clientHeight = 240, scrollTop = 0 } = {}) {
+  const state = { expandedId: null, clicks: 0 };
+  const list = { scrollTop, clientHeight, scrollHeight: total * rowHeight };
+
+  const makeRow = (i) => {
+    const id = `devtool-network-item-${i}`;
+    return {
+      getAttribute(n) {
+        if (n === 'data-cy') return id;
+        if (n === 'data-cy-event-id') return `evt-${i}`;
+        if (n === 'data-cy-event-start') return String(1000 + i * 10);
+        return null;
+      },
+      querySelector(sel) {
+        const map = {
+          '[data-cy=network-response-status-code]': i === 22 ? '401' : '200',
+          '[data-cy=network-response-method]': 'GET',
+          '[data-cy=network-response-path]': `resource-${i}`,
+        };
+        if (map[sel] !== undefined) return { textContent: map[sel] };
+        if (sel === '[data-cy$="-caret"]') return { click() { state.expandedId = id; state.clicks++; } };
+        return null;
+      },
+      click() { state.expandedId = id; state.clicks++; },
+    };
+  };
+
+  const renderedRows = () => {
+    const start = Math.max(0, Math.floor(list.scrollTop / rowHeight));
+    const end = Math.min(total, start + Math.ceil(clientHeight / rowHeight) + 1);
+    const out = [];
+    for (let i = start; i < end; i++) out.push(makeRow(i));
+    return out;
+  };
+
+  const document = {
+    title: 'Test Replay',
+    querySelectorAll(sel) {
+      if (sel === '[data-cy^=devtool-network-item-]') return renderedRows();
+      return [];
+    },
+    querySelector(sel) {
+      if (/aria-controls=network-tabpanel/.test(sel)) {
+        return { getAttribute: (n) => (n === 'aria-selected' ? 'true' : null), click() {} };
+      }
+      if (sel === '[data-cy=network-item-list]') return list;
+      const caret = sel.match(/^\[data-cy="(devtool-network-item-\d+)-caret"\]$/);
+      if (caret) {
+        const id = caret[1];
+        if (!renderedRows().some((r) => r.getAttribute('data-cy') === id)) return null;
+        return { click() { state.expandedId = id; state.clicks++; } };
+      }
+      if (sel === '#request-tabpanel') {
+        return state.expandedId ? { textContent: `REQUEST BODY for ${state.expandedId}` } : null;
+      }
+      if (sel === '#response-tabpanel') {
+        return state.expandedId ? { textContent: `RESPONSE BODY for ${state.expandedId}` } : null;
+      }
+      if (/aria-controls=response-tabpanel/.test(sel)) {
+        return { getAttribute: (n) => (n === 'aria-selected' ? 'true' : null), click() {} };
+      }
+      return null;
+    },
+  };
+  return { document, list, state };
+}
+
+function runNetProbe(expression, dom) {
+  return Promise.resolve(vm.runInNewContext(expression, { setTimeout, document: dom.document }, { timeout: 30000 }))
+    .then((v) => JSON.parse(JSON.stringify(v)));
+}
+
+test('network detail scrolls a virtualised row back into view before reading it', async () => {
+  // The caller listed all 61 rows, then asked about row 22 — which is far above
+  // the current window. Returning `row-not-rendered` here is the bug: the row
+  // exists, it is just not mounted.
+  const dom = makeNetworkDom({ total: 61, scrollTop: 24 * 33 });
+  const out = await runNetProbe(
+    probe.networkDetailExpr({ rowId: 'devtool-network-item-22', tabWaitMs: 0, expandWaitMs: 0 }),
+    dom,
+  );
+  assert.equal(out.error, undefined, `expected the row to be found, got ${JSON.stringify(out.error)}`);
+  assert.equal(out.request.id, 'devtool-network-item-22');
+  assert.equal(out.request.status, '401');
+  assert.match(out.requestDetail, /REQUEST BODY for devtool-network-item-22/);
+  assert.match(out.responseDetail, /RESPONSE BODY for devtool-network-item-22/);
+});
+
+test('network detail finds a row below the current window too', async () => {
+  const dom = makeNetworkDom({ total: 61, scrollTop: 0 });
+  const out = await runNetProbe(
+    probe.networkDetailExpr({ rowId: 'devtool-network-item-58', tabWaitMs: 0, expandWaitMs: 0 }),
+    dom,
+  );
+  assert.equal(out.error, undefined);
+  assert.equal(out.request.id, 'devtool-network-item-58');
+});
+
+test('network detail still reports a row that genuinely does not exist', async () => {
+  // Scrolling must not turn "no such row" into an infinite hunt: a rowId past
+  // the end of the list has to come back as an error, not a timeout.
+  const dom = makeNetworkDom({ total: 61, scrollTop: 0 });
+  const out = await runNetProbe(
+    probe.networkDetailExpr({ rowId: 'devtool-network-item-999', tabWaitMs: 0, expandWaitMs: 0 }),
+    dom,
+  );
+  assert.equal(out.error, 'row-not-rendered');
+  assert.ok(Array.isArray(out.rendered));
+});
+
+test('network detail does not scroll when the row is already mounted', async () => {
+  const dom = makeNetworkDom({ total: 61, scrollTop: 0 });
+  const before = dom.list.scrollTop;
+  const out = await runNetProbe(
+    probe.networkDetailExpr({ rowId: 'devtool-network-item-2', tabWaitMs: 0, expandWaitMs: 0 }),
+    dom,
+  );
+  assert.equal(out.error, undefined);
+  assert.equal(dom.list.scrollTop, before, 'a visible row must be read where it is');
+});

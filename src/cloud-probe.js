@@ -1106,6 +1106,67 @@ function networkSrc() {
       return e.scrollHeight > e.clientHeight + 20 && e.clientHeight > 80;
     });
     return all.length ? all[0] : null;
+  }
+  function netRowIndex(el) {
+    var m = String(el && el.getAttribute('data-cy') || '').match(/-(\\d+)$/);
+    return m ? Number(m[1]) : NaN;
+  }
+  /*
+   * Find one network row by id, scrolling the virtualised list to it if needed.
+   *
+   * A caller works from a full \`cloud_network_logs\` listing, but that listing
+   * scrolls the panel as it walks, so by the time the detail is requested the
+   * interesting row is usually unmounted. The row ids are positional
+   * (devtool-network-item-N), which is what makes aiming possible: estimate the
+   * row height from the rendered window, jump straight to the target, then
+   * correct a window at a time. Stepping stops as soon as the scroll position
+   * stops moving, so a row that does not exist ends as an error rather than a
+   * spin.
+   */
+  async function findNetRow(rowId, maxSteps) {
+    function find() {
+      var rows = netRows();
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute('data-cy') === rowId) return rows[i];
+      }
+      return null;
+    }
+    var row = find();
+    if (row) return { row: row, scrolled: false };
+
+    var target = Number(String(rowId).match(/-(\\d+)$/) ? String(rowId).match(/-(\\d+)$/)[1] : NaN);
+    var sc = netScroller();
+    if (!sc || !isFinite(target)) return { row: null, scrolled: false };
+
+    var rendered = netRows();
+    if (rendered.length > 1) {
+      var rowHeight = sc.clientHeight / (rendered.length - 1);
+      var aim = target * rowHeight - sc.clientHeight / 2;
+      sc.scrollTop = Math.max(0, Math.min(sc.scrollHeight, aim));
+      await nextFrame();
+      row = find();
+      if (row) return { row: row, scrolled: true };
+    }
+
+    for (var s = 0; s < maxSteps; s++) {
+      var cur = netRows();
+      if (!cur.length) break;
+      var lo = Infinity, hi = -Infinity;
+      for (var j = 0; j < cur.length; j++) {
+        var n = netRowIndex(cur[j]);
+        if (n < lo) lo = n;
+        if (n > hi) hi = n;
+      }
+      var before = sc.scrollTop;
+      if (target < lo) sc.scrollTop = Math.max(0, before - sc.clientHeight * 0.9);
+      else if (target > hi) sc.scrollTop = Math.min(sc.scrollHeight, before + sc.clientHeight * 0.9);
+      else break;
+      await nextFrame();
+      row = find();
+      if (row) return { row: row, scrolled: true };
+      if (sc.scrollTop === before) break;
+    }
+    return { row: find(), scrolled: true };
   }`;
 }
 
@@ -1205,17 +1266,15 @@ async function networkDetailProbe(opts) {
   var tab = activateNetworkTab();
   if (tab.activated) await new Promise(function (r) { setTimeout(r, opts.tabWaitMs); });
 
-  var rows = netRows();
-  var row = null;
-  for (var i = 0; i < rows.length; i++) {
-    if (rows[i].getAttribute('data-cy') === opts.rowId) { row = rows[i]; break; }
-  }
+  var found = await findNetRow(opts.rowId, opts.maxScrollSteps || 40);
+  var row = found.row;
   if (!row) {
     return {
       error: 'row-not-rendered',
       rowId: opts.rowId,
-      rendered: rows.map(function (r) { return r.getAttribute('data-cy'); }),
-      hint: 'The network list is virtualised — that row is not currently in the DOM. Re-run `cloud_network_logs` and use a row from the freshly returned list.',
+      rendered: netRows().map(function (r) { return r.getAttribute('data-cy'); }),
+      scrolled: found.scrolled,
+      hint: 'That row is not in the network list even after scrolling to look for it. Re-run `cloud_network_logs` and use a row from the freshly returned list.',
     };
   }
   var info = netInfo(row);
@@ -1244,7 +1303,7 @@ async function networkDetailProbe(opts) {
   };
 }
 
-const networkDetailExpr = (opts) => exprWithHelpers(networkDetailProbe, [networkSrc()], opts);
+const networkDetailExpr = (opts) => exprWithHelpers(networkDetailProbe, [frameWaitSrc(), networkSrc()], opts);
 
 module.exports = {
   expr,
