@@ -278,7 +278,7 @@ async function runMcp() {
     };
   }
 
-  const server = new McpServer({ name: 'cypress-inspect', version: '0.21.0' });
+  const server = new McpServer({ name: 'cypress-inspect', version: '0.22.0' });
 
   // Tool annotations let MCP clients (Claude Code, etc.) reason about a tool
   // before calling it. `readOnlyHint: true` marks a tool as safe to run without

@@ -1,6 +1,6 @@
 {
   "name": "cypress-inspect",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "MCP server + CDP attach for debugging Cypress test failures from Claude / VS Code / any MCP-capable agent.",
   "bin": {
     "cypress-inspect": "bin/cypress-inspect.js"
@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "@zip.js/zip.js": "^2.17.0",
     "chrome-remote-interface": "^0.33.2",
     "zod": "^3.23.8"
   },

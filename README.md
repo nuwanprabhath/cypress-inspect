@@ -382,6 +382,56 @@ same run, after which every other cloud tool addresses the newly selected test.
   `data-cy-event-id`, so a line that legitimately fired twice stays twice — which is
   exactly the signal you want when hunting a loop that ran more often than it should.
 
+### Tom mode — CI failures from the Allure pipeline reporter
+
+When the Cypress Cloud plan runs out, the evidence for a CI failure lives in the
+Allure artifacts Tom's pipeline reporter leaves on each job (`feat/allure-core`
+capture + `feat/allure-viewer` decoding). `cypress-inspect tom` reads those
+artifacts directly. There is nothing to scrape: the evidence is JSON and a
+Playwright-format trace zip per failing test, so this mode needs **no browser**
+for the common questions and answers most in well under a second.
+
+It is a CLI, not MCP tools, on purpose: it reloads on every run, so the tool can
+be changed mid-investigation and the next command uses the change. It is fully
+isolated from `open` / `run` / `cloud`: its own `src/tom-*.js` modules and its
+own cache at `~/.cypress-inspect/tom-cache/`.
+
+```bash
+cypress-inspect tom summary 16669680637        # a job id, or paste any reporter / GitLab URL
+cypress-inspect tom timeline                   # the job is remembered after the first command
+cypress-inspect tom where afa9778b             # <test> = id, id prefix, name substring, or reporter URL
+```
+
+| command | answers |
+|---|---|
+| `summary` | counts, every failure in **execution** order, and the server's loudest warnings |
+| `timeline` | failures in context, with what passed between them: the cascade view |
+| `test <t>` | the full error, attachments, reporter link |
+| `steps <t> [--around]` | the command log, one line per action |
+| `step <t> <n>` | one action's args and error, plus the console and network inside its window |
+| `where <t> [n]` | route, protocol, project and open dialogs at a step |
+| `dom <t> [n] [--cy] [--find q]` | the DOM at a step; `--find` says whether it matched a **data-cy or only text** |
+| `render <t> [n]` | a PNG of the DOM at any step, rendered offline from the trace |
+| `console <t>` / `network <t>` | filtered console and network; URLs compacted, `hash=` kept |
+| `diff <a> <b>` | two tests' network paired by endpoint, flagging status, hash and body-size changes |
+| `log [core\|org\|webapp] [--at <t>] [--digest]` | server logs from `diagnostics.tar.gz`, joined to a test by time |
+| `jobs <pipeline>` | a pipeline's jobs **including retried attempts** |
+
+The first command downloads the job's whole artifact archive once (via `glab`,
+~13 s for 160 MB) and unpacks it. Artifacts on this project expire after about
+a day, and a local copy is the only thing that survives that.
+
+The trace decoder is Tom's own `read-trace.js`, vendored under
+`src/tom-vendor/` and pinned (see `VENDORED_FROM`), because its comments are
+explicit that getting the action sort wrong **misaligns** rows rather than
+reordering them. The DOM snapshot resolution, including Playwright's
+back-references, is local.
+
+`render` inlines the trace's own stylesheet, fonts and images and captures over
+CDP in a throwaway headless Chrome with a fresh profile. It does **not** use
+Chrome's `--screenshot` flag, which ignores script-driven scrolling and draws
+every `position: fixed` element at its document offset on any scrolled frame.
+
 ## Tools (v0.10)
 
 Every tool carries an MCP [annotation](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations) so clients can reason about it before calling. Read-only tools are marked `readOnlyHint: true` (clients may auto-approve them). The three tools that re-run a spec or wipe app state — `clear_app_state`, `rerun_spec`, `reset_and_rerun` — are marked `destructiveHint: true` and their descriptions begin with **"⚠ REQUIRES HUMAN APPROVAL — do not run autonomously"** so an agent won't trigger runs on its own. `eval` is neither (it can mutate), so clients should prompt for it. **The actual gate is your MCP client's permission system** — e.g. in Claude Code, leave these tools off the allowlist so each call prompts; the annotations/warnings just make that the obvious default.

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.22.0
+
+### Added
+- **Tom mode: `cypress-inspect tom`.** Debug a CI Cypress failure from the Allure
+  artifacts Tom's pipeline reporter leaves on each job, for when Cypress Cloud
+  is unavailable. A data-driven CLI, isolated from every other mode: it reads the
+  job artifact (`allure/` JSON plus a Playwright-format trace zip per failing
+  test) and needs no browser except to render.
+
+  Commands: `summary`, `timeline`, `list`, `test`, `steps`, `step`, `where`,
+  `dom`, `render`, `console`, `network`, `diff`, `log`, `shot`, `jobs`, `fetch`.
+
+  Built while debugging a real failure (`1_refresh-data.cy.js`, job
+  16669680637), and each command exists because that investigation needed it:
+
+  - `summary` lists failures in **execution** order. The reporter's own brief
+    listed three failures and hid the one that ran first.
+  - `summary` and `log --digest` surface the server's loudest warnings. The root
+    cause was a core log line (`url_hash` TTL defaulting to 300 s, 252
+    occurrences) that nothing in the report pointed at.
+  - `diff` pairs two tests' requests. It shows the key finding on one screen: two
+    refreshes sending the **same** `hash=` and getting 6 kB and 100 kB back.
+  - `dom --find` labels every hit as a data-cy match or a **text-only** match.
+    Unlabelled, a text hit on the workflow header read as "the element Cypress
+    could not find was there", which is the opposite of the truth.
+  - `render` produces a PNG of any step offline, validated against Cypress's own
+    failure screenshot.
+
+  The trace decoder is the reporter's own `read-trace.js`, vendored and pinned
+  under `src/tom-vendor/`. New dependency: `@zip.js/zip.js`.
+
+### Fixed during development (worth knowing if you build something similar)
+- **Chrome's `--screenshot` flag is wrong for scrolled pages.** It captures
+  independently of script-driven scrolling, so every `position: fixed` element
+  lands at its document offset over a blank page. `render` scrolls and then
+  captures over CDP instead. The first theory, that frozen CSS transitions were
+  to blame, was wrong and is recorded as such in the code.
+- Text matching in `find` uses an element's own text nodes. Matching on
+  descendant text also reported every wrapper around a label, including `<body>`.
+
 ## 0.21.0
 
 ### Added

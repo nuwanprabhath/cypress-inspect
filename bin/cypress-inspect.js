@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const { runOpen, runRun } = require('../src/launcher');
 const { runCloud } = require('../src/cloud-launcher');
+const { runTom } = require('../src/tom-cli');
 const { runMcp } = require('../src/mcp-server');
 const { readSession, printSession } = require('../src/session');
 const { readCloudSession, printCloudSession } = require('../src/cloud-session');
@@ -18,6 +19,8 @@ async function main() {
       return runRun(rest);
     case 'cloud':
       return runCloud(rest);
+    case 'tom':
+      return runTom(rest);
     case 'mcp':
       return runMcp(rest);
     case 'status':
@@ -47,6 +50,7 @@ function printHelp() {
     '  cypress-inspect run  [-- <cypress args>]   Launch `cypress run` kept-open for inspection (EXPERIMENTAL)',
     '  cypress-inspect cloud [url] [--port N] [--headless]',
     '                                            Launch a CDP-enabled browser for Cypress Cloud Test Replay',
+    '  cypress-inspect tom <cmd> [job|url]        Debug a CI failure from Tom\'s Allure pipeline reporter (see `tom help`)',
     '  cypress-inspect mcp                        Run MCP server over stdio',
     '  cypress-inspect status                     Show current session info (local + cloud)',
     '',
