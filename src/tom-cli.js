@@ -46,13 +46,27 @@ function parse(argv) {
   return { job, rest, flags, testFromUrl }
 }
 
+/**
+ * The job to use: the one passed, else the one remembered from the last run.
+ *
+ * Both cases are announced on stderr (stdout stays clean for piping). Passing
+ * a job to ONE command also makes it the default for the NEXT, and silently
+ * that bit during triage: a comparison against an older job switched the
+ * default, and the next lookup ran against the wrong artifact and reported
+ * "no test matches" for a test that was right there in the intended job.
+ */
 function jobOrLast(job) {
+  const prev = fs.existsSync(LAST()) ? fs.readFileSync(LAST(), 'utf8').trim() : null
   if (job) {
     fs.mkdirSync(store.CACHE_ROOT, { recursive: true })
     fs.writeFileSync(LAST(), String(job))
-    return job
+    if (prev && prev !== String(job)) process.stderr.write(`job ${job}   (remembered job changed: ${prev} → ${job})\n`)
+    return String(job)
   }
-  if (fs.existsSync(LAST())) return fs.readFileSync(LAST(), 'utf8').trim()
+  if (prev) {
+    process.stderr.write(`job ${prev}   (remembered from the last command; pass a job id or URL to change it)\n`)
+    return prev
+  }
   throw new Error('no job: pass a job id or a reporter/GitLab URL once, then it is remembered')
 }
 
@@ -654,4 +668,4 @@ async function runTom(argv) {
   }
 }
 
-module.exports = { runTom, commands, parse, errorHead }
+module.exports = { runTom, commands, parse, errorHead, jobOrLast }

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.22.1
+
+### Fixed
+- **`tom` always says which job it is reading.** Passing a job to one command
+  also makes it the default for the next, and that used to happen silently: a
+  comparison against an older job switched the default, and the next lookup ran
+  against the wrong artifact and reported "no test matches" for a test that was
+  in the intended job. Now stderr announces the job whenever it is taken from
+  memory, and whenever an explicit job replaces the remembered one
+  (`remembered job changed: A → B`). stdout is unchanged, so piping still works.
+- The "no test matches" error names the job it searched and suggests passing the
+  job explicitly.
+
 ## 0.22.0
 
 ### Added

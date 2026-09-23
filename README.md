@@ -398,7 +398,7 @@ own cache at `~/.cypress-inspect/tom-cache/`.
 
 ```bash
 cypress-inspect tom summary 16669680637        # a job id, or paste any reporter / GitLab URL
-cypress-inspect tom timeline                   # the job is remembered after the first command
+cypress-inspect tom timeline                   # the job is remembered; stderr says which one each command used
 cypress-inspect tom where afa9778b             # <test> = id, id prefix, name substring, or reporter URL
 ```
 

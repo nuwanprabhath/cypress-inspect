@@ -183,7 +183,7 @@ function resolveTest(dir, query) {
     const needle = q.toLowerCase()
     hits = all.filter((r) => `${r.suite} ${r.name}`.toLowerCase().includes(needle))
   }
-  if (!hits.length) throw new Error(`no test matches "${q}"`)
+  if (!hits.length) throw new Error(`no test matches "${q}" in ${path.basename(path.dirname(path.dirname(dir)))} (wrong job? pass the job id explicitly)`)
   if (hits.length > 1) {
     // Prefer the failing one when a name is shared across retries — that is
     // nearly always what "the test" means during triage.

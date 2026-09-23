@@ -209,3 +209,32 @@ test('logDigest normalises ids and numbers so one message counts once', () => {
   ]
   assert.equal(store.logDigest(rows).length, 1)
 })
+
+test('the job in use is always announced, including when the default switches', () => {
+  // Passing a job to one command makes it the default for the next; silently,
+  // that sent a lookup to the wrong artifact during triage. Run in a child
+  // process because the cache root is read from the environment at load time.
+  const { execFileSync } = require('child_process')
+  const cache = fs.mkdtempSync(path.join(os.tmpdir(), 'tom-last-'))
+  const run = (arg) =>
+    execFileSync(process.execPath, ['-e', `const c=require(${JSON.stringify(path.resolve(__dirname, '../src/tom-cli.js'))}); process.stdout.write(c.jobOrLast(${JSON.stringify(arg)}))`], {
+      env: { ...process.env, CYPRESS_INSPECT_TOM_CACHE: cache },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+    })
+  const spawnBoth = (arg) => {
+    const r = require('child_process').spawnSync(process.execPath, ['-e', `const c=require(${JSON.stringify(path.resolve(__dirname, '../src/tom-cli.js'))}); process.stdout.write(String(c.jobOrLast(${JSON.stringify(arg)})))`], {
+      env: { ...process.env, CYPRESS_INSPECT_TOM_CACHE: cache },
+      encoding: 'utf8',
+    })
+    return { out: r.stdout, err: r.stderr }
+  }
+  assert.equal(run('111'), '111')
+  const remembered = spawnBoth(null)
+  assert.equal(remembered.out, '111')
+  assert.match(remembered.err, /job 111 .*remembered/)
+  const switched = spawnBoth('222')
+  assert.equal(switched.out, '222')
+  assert.match(switched.err, /remembered job changed: 111 → 222/)
+  fs.rmSync(cache, { recursive: true, force: true })
+})
