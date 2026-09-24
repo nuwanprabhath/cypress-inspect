@@ -238,3 +238,25 @@ test('the job in use is always announced, including when the default switches', 
   assert.match(switched.err, /remembered job changed: 111 → 222/)
   fs.rmSync(cache, { recursive: true, force: true })
 })
+
+test('a report packed into allure/report.zip is unpacked and read', () => {
+  // Newer reporter builds (the paratoo 1.0.11 port, job 16697896384) pack every
+  // JSON file into allure/report.zip and leave only attachments loose, so there
+  // is no root test-results.json. Detection used to key off that file and
+  // called a 113 MB artifact "not a reporter shard".
+  const { execFileSync } = require('child_process')
+  const cache = fs.mkdtempSync(path.join(os.tmpdir(), 'tom-pack-'))
+  const allure = path.join(cache, '999', 'extracted', 'allure')
+  const stage = path.join(cache, 'stage')
+  fs.mkdirSync(path.join(stage, 'data', 'test-results'), { recursive: true })
+  fs.writeFileSync(path.join(stage, 'data', 'test-results', 'a'.repeat(32) + '.json'),
+    JSON.stringify({ id: 'a'.repeat(32), name: 't', status: 'broken', start: 1, fullName: 'x:spec.cy.js#s t', labels: [] }))
+  fs.mkdirSync(path.join(allure, 'data', 'attachments'), { recursive: true })
+  execFileSync('zip', ['-q', '-r', path.join(allure, 'report.zip'), 'data'], { cwd: stage })
+  const r = require('child_process').spawnSync(process.execPath, ['-e',
+    `const s=require(${JSON.stringify(path.resolve(__dirname, '../src/tom-store.js'))});` +
+    `console.log(s.isCached('999'), s.listAll(s.allureDir('999')).map(x=>x.status).join())`], {
+    env: { ...process.env, CYPRESS_INSPECT_TOM_CACHE: cache }, encoding: 'utf8' })
+  assert.equal(r.stdout.trim(), 'true broken', r.stderr)
+  fs.rmSync(cache, { recursive: true, force: true })
+})

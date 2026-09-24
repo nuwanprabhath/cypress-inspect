@@ -43,7 +43,28 @@ function parseTestParam(input) {
   return m ? m[1] : null
 }
 
-const isCached = (job) => fs.existsSync(path.join(allureDir(job), 'test-results.json'))
+/**
+ * A report is on disk when its per-test results are, not when a root
+ * `test-results.json` is: newer reporter builds pack every JSON file into
+ * `allure/report.zip` (paths.js REPORT.pack) and leave only the attachments
+ * loose, so that file never appears at the root.
+ */
+const hasResults = (dir) => fs.existsSync(path.join(dir, 'data', 'test-results'))
+
+/**
+ * Unpack `allure/report.zip` in place if the results are only inside it. Never
+ * overwrites: loose files already in the artifact win over the packed copy.
+ * Returns true if a report is now available.
+ */
+function unpackReport(dir) {
+  if (hasResults(dir)) return true
+  const pack = path.join(dir, 'report.zip')
+  if (!fs.existsSync(pack)) return false
+  execFileSync('unzip', ['-q', '-n', pack, '-d', dir], { stdio: ['ignore', 'ignore', 'pipe'] })
+  return hasResults(dir)
+}
+
+const isCached = (job) => fs.existsSync(path.join(jobDir(job), 'extracted', 'allure')) && unpackReport(allureDir(job))
 
 /**
  * Make sure a job's artifact is on disk and unpacked; return its `allure/` dir.
@@ -83,7 +104,10 @@ function ensureJob(job, { refresh = false, log = () => {} } = {}) {
   fs.rmSync(out, { recursive: true, force: true })
   execFileSync('unzip', ['-q', '-o', zip, '-d', out], { stdio: ['ignore', 'ignore', 'pipe'] })
   if (!isCached(job)) {
-    throw new Error(`job ${job}: artifact unpacked but has no allure/test-results.json — not a reporter shard?`)
+    throw new Error(
+      `job ${job}: artifact has no Allure results (no allure/data/test-results/ and no allure/report.zip). ` +
+        `Was the pipeline run with RUN_ALLURE_REPORT=true? Without it the reporter writes nothing.`,
+    )
   }
   return allureDir(job)
 }
@@ -95,7 +119,9 @@ const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'))
  * Flatten whatever the wrapper key is — it is Allure's, not ours.
  */
 function loadIndex(dir) {
-  const raw = readJson(path.join(dir, 'test-results.json'))
+  const p = path.join(dir, 'test-results.json')
+  if (!fs.existsSync(p)) return listAll(dir).map(({ id, name, duration, status }) => ({ id, name, duration, status }))
+  const raw = readJson(p)
   const out = []
   const visit = (o) => {
     if (!o || typeof o !== 'object') return

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.22.2
+
+### Fixed
+- **`tom` reads reports packed into `allure/report.zip`.** Newer reporter builds
+  (the paratoo 1.0.11 port) pack every JSON file into that zip and leave only the
+  attachments loose, so there is no root `test-results.json`. `tom` treated a
+  113 MB artifact as "not a reporter shard". It now detects a report by
+  `allure/data/test-results/` and unpacks `report.zip` in place when needed,
+  never overwriting loose files.
+- When a job has no Allure results at all, the error now says the likely cause:
+  the pipeline ran without `RUN_ALLURE_REPORT=true`.
+
 ## 0.22.1
 
 ### Fixed
